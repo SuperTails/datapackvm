@@ -479,7 +479,7 @@ impl FunctionId {
 impl FromStr for FunctionId {
     type Err = String;
 
-    fn from_str(mut s: &str) -> Result<Self, Self::Err> {
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(FunctionId { name: s.to_string() })
         /*
         let sub = if let Some(idx) = s.find("-sub") {
