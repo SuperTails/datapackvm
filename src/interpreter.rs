@@ -2,10 +2,11 @@ use crate::cir::*;
 //use crate::compile_ir::{get_index, pos_to_func_idx, OBJECTIVE};
 //use crate::Datapack;
 use std::collections::HashMap;
+use std::convert::TryFrom;
 use std::str::FromStr;
 
 pub fn get_index(x: i32, y: i32, z: i32) -> Result<i32, InterpError> {
-    if 0 <= x && x < 8 && 0 <= y && y < 256 && 0 <= z && z < 8 {
+    if (0..8).contains(&x) && (0..256).contains(&y) && (0..8).contains(&z) {
         Ok((x * 8 * 8 + y * 8 + z) * 4)
     } else {
         Err(InterpError::OutOfBoundsAccess(x, y, z))
@@ -22,6 +23,7 @@ pub enum InterpError {
     EnteredTodo,
     AssertionFailed,
     BreakpointHit,
+    SyncHit(usize, usize),
     InvalidBranch(usize),
     MultiBranch(FunctionId, Option<FunctionId>),
     NoBlockData(i32, i32, i32, String),
@@ -38,6 +40,7 @@ impl std::fmt::Display for InterpError {
             InterpError::EnteredTodo => write!(f, "entered code not yet implemented"),
             InterpError::AssertionFailed => write!(f, "assertion failed"),
             InterpError::BreakpointHit => write!(f, "breakpoint hit"),
+            InterpError::SyncHit(f_idx, i_idx) => write!(f, "sync hit at {} {}", f_idx, i_idx),
             InterpError::InvalidBranch(b) => write!(f, "invalid branch to {}", b),
             InterpError::MultiBranch(prev, att) => {
                 write!(f, "branch to more than one block (previous was {}, attempted was ", prev)?;
@@ -79,13 +82,110 @@ impl Scoreboard {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum CmdBlockKind {
+    Impulse,
+    Chain,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Facing {
+    North,
+    South,
+    East,
+    West,
+}
+
+impl FromStr for Facing {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "north" => Ok(Facing::North),
+            "south" => Ok(Facing::South),
+            "east" => Ok(Facing::East),
+            "west" => Ok(Facing::West),
+            _ => Err(s.to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommandBlock {
+    kind: CmdBlockKind,
+    facing: Facing,
+    command: String,
+    conditional: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Block {
-    Command(String),
+    Command(CommandBlock),
     Redstone,
     Jukebox(i32),
     Other(String),
 }
 
+impl TryFrom<&BlockSpec> for Block {
+    type Error = String;
+
+    fn try_from(block: &BlockSpec) -> Result<Self, Self::Error> {
+        match block.id.as_str() {
+            "minecraft:redstone_block" => Ok(Block::Redstone),
+            "minecraft:jukebox" => {
+                assert!(block.state.is_empty());
+
+                let idx = block.nbt.find("Memory:").unwrap();
+                let rest = &block.nbt[idx + "Memory:".len()..];
+                let end_idx = rest.find('}').unwrap();
+
+                let val = rest[..end_idx].parse().unwrap();
+                Ok(Block::Jukebox(val))
+            }
+            "minecraft:command_block" => {
+                let conditional = block.state.get("conditional").unwrap_or("false").parse::<bool>().unwrap();
+                let facing = block.state.get("facing").unwrap_or("north").parse::<Facing>().unwrap();
+
+                let command = if let Some(cmd_start) = block.nbt.find("{Command:\"") {
+                    let start = cmd_start + "{Command:\"".len();
+                    let end = block.nbt.find("\"}").unwrap();
+                    block.nbt[start..end].to_string()
+                } else {
+                    String::new()
+                };
+
+                Ok(Block::Command(CommandBlock {
+                    kind: CmdBlockKind::Impulse,
+                    conditional,
+                    command,
+                    facing,
+                }))
+            }
+            "minecraft:chain_command_block" => {
+                let conditional = block.state.get("conditional").unwrap_or("false").parse::<bool>().unwrap();
+                let facing = block.state.get("facing").unwrap_or("north").parse::<Facing>().unwrap();
+
+                let command = if let Some(cmd_start) = block.nbt.find("{Command:\"") {
+                    let start = cmd_start + "{Command:\"".len();
+                    let end = block.nbt.find("\"}").unwrap();
+                    block.nbt[start..end].to_string()
+                } else {
+                    String::new()
+                };
+
+                Ok(Block::Command(CommandBlock {
+                    kind: CmdBlockKind::Chain,
+                    conditional,
+                    command,
+                    facing,
+                }))
+            }
+            id => Ok(Block::Other(id.to_string()))
+        }
+
+    }
+}
+
+/*
 impl FromStr for Block {
     type Err = String;
 
@@ -103,18 +203,21 @@ impl FromStr for Block {
             let start = s.find("{Command:\"").unwrap() + "{Command:\"".len();
             let end = s.find("\"}").unwrap();
             Ok(Block::Command(s[start..end].to_string()))
+        } else if s.starts_with("minecraft:chain_command_block") {
+            todo!("{:?}", s);
         } else {
             Ok(Block::Other(s.to_string()))
         }
     }
 }
+*/
 
 pub struct Interpreter {
     pub scoreboard: Scoreboard,
 
     pub(crate) call_stack: Vec<(usize, usize)>,
     ctx_pos: Option<(i32, i32, i32)>,
-    program: Vec<Function>,
+    pub program: Vec<Function>,
 
     memory: [i32; 8 * 256 * 8],
 
@@ -125,13 +228,18 @@ pub struct Interpreter {
     global_ptr_pos: (i32, i32, i32),
     frame_ptr_pos: (i32, i32, i32),
     stack_ptr_pos: (i32, i32, i32),
+    cond_stack_ptr_pos: (i32, i32, i32),
 
     ptr_pos: (i32, i32, i32),
     turtle_pos: (i32, i32, i32),
+    next_chain_pos: (i32, i32, i32),
+
     next_pos: Option<(usize, usize, (i32, i32, i32))>,
     letters: HashMap<(i32, i32, i32), char>,
     pub output: Vec<String>,
     pub tick: usize,
+
+    pub last_commands_run: usize,
     commands_run: usize,
 
     memory_points: HashMap<usize, BreakKind>,
@@ -169,12 +277,15 @@ impl Interpreter {
             frame_ptr_pos: Default::default(),
             local_ptr_pos: Default::default(),
             stack_ptr_pos: Default::default(),
+            cond_stack_ptr_pos: Default::default(),
             global_ptr_pos: Default::default(),
             memory: [0x55_55_55_55; 8 * 256 * 8],
             scoreboard: Scoreboard::default(),
             ptr_pos: (0, 0, 0),
             turtle_pos: (0, 0, 0),
+            next_chain_pos: (0, 0, 0),
             next_pos: None,
+            last_commands_run: 0,
             commands_run: 0,
             tick: 0,
             output: Vec::new(),
@@ -205,12 +316,15 @@ impl Interpreter {
             frame_ptr_pos: Default::default(),
             local_ptr_pos: Default::default(),
             stack_ptr_pos: Default::default(),
+            cond_stack_ptr_pos: Default::default(),
             global_ptr_pos: Default::default(),
             memory: [0x55_55_55_55; 8 * 256 * 8],
             scoreboard: Scoreboard::default(),
             ptr_pos: (0, 0, 0),
             turtle_pos: (0, 0, 0),
+            next_chain_pos: (0, 0, 0),
             next_pos: None,
+            last_commands_run: 0,
             commands_run: 0,
             tick: 0,
             output: Vec::new(),
@@ -250,12 +364,15 @@ impl Interpreter {
             frame_ptr_pos: Default::default(),
             local_ptr_pos: Default::default(),
             stack_ptr_pos: Default::default(),
+            cond_stack_ptr_pos: Default::default(),
             global_ptr_pos: Default::default(),
             scoreboard: Scoreboard::default(),
             ptr_pos: (0, 0, 0),
             turtle_pos: (0, 0, 0),
+            next_chain_pos: (0, 0, 0),
             next_pos: None,
             tick: 0,
+            last_commands_run: 0,
             commands_run: 0,
             output: Vec::new(),
             memory_points: HashMap::new(),
@@ -286,7 +403,7 @@ impl Interpreter {
     pub fn set_next_pos(&mut self, func_idx: usize, pos: (i32, i32, i32)) -> Result<(), InterpError> {
         if let Some((f, _, _)) = self.next_pos {
             let att = self.program.get(func_idx).map(|f| f.id.clone());
-           Err(InterpError::MultiBranch(self.program[f].id.clone(), att))
+            Err(InterpError::MultiBranch(self.program[f].id.clone(), att))
         } else if func_idx >= self.program.len() {
             Err(InterpError::InvalidBranch(func_idx))
         } else {
@@ -421,31 +538,28 @@ impl Interpreter {
         self.get_word(index as usize)
     }
 
-    fn set_block(&mut self, pos: (i32, i32, i32), block: &str, mode: SetBlockKind) {
-        if block == "minecraft:air" {
+    fn set_block(&mut self, pos: (i32, i32, i32), block: &BlockSpec, mode: SetBlockKind) {
+        if block.id == "minecraft:air" {
             self.blocks.remove(&pos);
         } else {
-            let block = block.parse::<Block>().unwrap();
+            println!("{:?}", pos);
+
+            let block = Block::try_from(block).unwrap();
 
             if block == Block::Redstone && (self.blocks.get(&pos) != Some(&Block::Redstone) || mode == SetBlockKind::Destroy) {
                 let cmd = (pos.0, pos.1 - 1, pos.2);
-                let b = self.blocks.get(&cmd).unwrap();
-                if let Block::Command(c) = b {
-                    let c = c.parse::<Command>().unwrap();
+                println!("Checking for command block at {:?}", cmd);
+                let b = self.blocks.get(&cmd).unwrap_or_else(|| panic!("{:?}", cmd));
+                if let Block::Command(CommandBlock { kind: CmdBlockKind::Impulse, command, .. }) = b {
+                    let c = command.parse::<Command>().unwrap();
                     let id = if let Command::FuncCall(FuncCall { id }) = c {
                         id
                     } else {
                         todo!("{}", c)
                     };
 
-                    let mut idx = None;
-                    for (i, f) in self.program.iter().enumerate() {
-                        if f.id == id {
-                            idx = Some(i);
-                            break;
-                        }
-                    }
-                    let idx = idx.unwrap();
+                    let idx = self.get_func_idx(&id);
+
 
                     self.set_next_pos(idx, cmd).unwrap();
                 }
@@ -453,6 +567,65 @@ impl Interpreter {
 
             self.blocks.insert(pos, block);
         }
+    }
+
+    /// `pos` is the position of the original command block
+    /// returns true if execution should continue
+    fn trigger_chain(&mut self, pos: (i32, i32, i32)) -> bool {
+        let facing = if let Some(Block::Command(CommandBlock { facing, .. })) = self.blocks.get(&pos) {
+            *facing
+        } else {
+            panic!()
+        };
+
+        let next_pos = match facing {
+            Facing::East => (pos.0 + 1, pos.1, pos.2),
+            Facing::West => (pos.0 - 1, pos.1, pos.2),
+            Facing::South => (pos.0, pos.1, pos.2 + 1),
+            Facing::North => (pos.0, pos.1, pos.2 - 1),
+        };
+
+        self.trigger_at(next_pos)
+    }
+
+    /// returns true if execution should continue
+    fn trigger_at(&mut self, pos: (i32, i32, i32)) -> bool {
+        if let Some(Block::Command(CommandBlock { kind: CmdBlockKind::Chain, command, .. })) = self.blocks.get(&pos) {
+            if !command.is_empty() {
+                let c = command.parse::<Command>().unwrap();
+                let id = if let Command::FuncCall(FuncCall { id }) = c {
+                    id
+                } else {
+                    todo!("{}", c)
+                };
+
+                let idx = self.get_func_idx(&id);
+
+                assert!(self.call_stack.is_empty());
+
+                self.call_stack.push((idx, 0));
+                self.ctx_pos = Some(pos);
+
+                eprintln!("Stackptr at beginning of {} [chained at {:?}] is {:?}", self.program[idx].id, pos, self.stack_ptr_pos);
+
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    }
+
+    fn get_func_idx(&self, id: &FunctionId) -> usize {
+        let mut idx = None;
+        for (i, f) in self.program.iter().enumerate() {
+            if &f.id == id {
+                idx = Some(i);
+                break;
+            }
+        }
+        idx.unwrap()
     }
 
     fn get_pos(&self, target: &Target) -> (i32, i32, i32) {
@@ -464,7 +637,9 @@ impl Interpreter {
                     "@e[tag=frameptr]" => self.frame_ptr_pos,
                     "@e[tag=globalptr]" => self.global_ptr_pos,
                     "@e[tag=stackptr]" => self.stack_ptr_pos,
+                    "@e[tag=condstackptr]" => self.cond_stack_ptr_pos,
                     "@e[tag=turtle]" => self.turtle_pos,
+                    "@e[tag=nextchain]" => self.next_chain_pos,
                     t => todo!("{:?}", t),
                 }
             }
@@ -481,7 +656,9 @@ impl Interpreter {
                     "@e[tag=frameptr]" => "frameptr",
                     "@e[tag=globalptr]" => "globalptr",
                     "@e[tag=stackptr]" => "stackptr",
+                    "@e[tag=condstackptr]" => "condstackptr",
                     "@e[tag=turtle]" => "turtle",
+                    "@e[tag=nextchain]" => "nextchain",
                     t => todo!("{:?}", t),
                 }.to_string()
             }
@@ -500,6 +677,21 @@ impl Interpreter {
             }
             None => Err(InterpError::NoBlockData(pos.0, pos.1, pos.2, path.to_string())),
             b => todo!("{:?} {:?}", b, pos)
+        }
+    }
+
+    fn set_block_data_str(&mut self, pos: (i32, i32, i32), path: &str, value: &str) -> Result<(), InterpError> {
+        match self.blocks.get_mut(&pos) {
+            Some(Block::Command(c)) => {
+                if path == "Command" {
+                    println!("Setting at {:?}", pos);
+                    c.command = value.to_string();
+                    Ok(())
+                } else {
+                    Err(InterpError::NoBlockData(pos.0, pos.1, pos.2, path.to_string()))
+                }
+            }
+            _ => Err(InterpError::NoBlockData(pos.0, pos.1, pos.2, path.to_string())),
         }
     }
 
@@ -536,6 +728,17 @@ impl Interpreter {
         }*/
 
         match cmd {
+            Command::Gamerule(Gamerule { rule, value, }) => {
+                // TODO:
+                match rule.as_str() {
+                    "maxCommandChainLength" => {
+                        assert!(value.is_none());
+
+                        Ok(Some(600_000))
+                    }
+                    _ => todo!("{} {:?}", rule, value)
+                }
+            }
             Command::ScoreAdd(ScoreAdd { target: Target::Uuid(target), target_obj, score }) => {
                 let mut lhs = self.get_score(target, target_obj).unwrap();
                 lhs = lhs.wrapping_add(*score);
@@ -559,7 +762,7 @@ impl Interpreter {
                             }
                             ScoreOpKind::SubAssign => {
                                 let mut val = self.get_score(target, target_obj).unwrap();
-                                val -= rhs;
+                                val = val.wrapping_sub(rhs);
                                 self.scoreboard.set(target, target_obj, val);
                             }
                             ScoreOpKind::MulAssign => {
@@ -568,30 +771,39 @@ impl Interpreter {
                                 self.scoreboard.set(target, target_obj, val);
                             }
                             ScoreOpKind::DivAssign => {
-                                let mut val = self.get_score(target, target_obj).unwrap();
+                                let lhs = self.get_score(target, target_obj).unwrap();
 
                                 // Minecraft div rounds towards -infinity
-                                if (val < 0 && rhs < 0) || (val > 0 && rhs > 0) {
-                                    val /= rhs;
+                                let val = if (lhs >= 0) == (rhs >= 0) {
+                                    lhs.wrapping_div(rhs)
                                 } else {
-                                    val = val.abs();
-                                    let rhs = rhs.abs();
-
-                                    // -1 / 3
-
-                                    val = -((val + rhs - 1) / rhs);
-                                }
+                                    let nat_div = lhs / rhs;
+                                    if lhs != nat_div * rhs {
+                                        nat_div - 1
+                                    } else {
+                                        nat_div
+                                    }
+                                };
 
                                 self.scoreboard.set(target, target_obj, val);
                             }
                             ScoreOpKind::ModAssign => {
-                                let mut val = self.get_score(target, target_obj).unwrap();
-                                if rhs < 0 {
-                                    todo!("DETERMINE BEHAVIOR")
+                                let lhs = self.get_score(target, target_obj).unwrap();
+
+                                let quot = if (lhs >= 0) == (rhs >= 0) {
+                                    lhs.wrapping_div(rhs)
                                 } else {
-                                    val = val.rem_euclid(rhs);
-                                }
-                                self.scoreboard.set(target, target_obj, val);
+                                    let nat_div = lhs / rhs;
+                                    if lhs != nat_div * rhs {
+                                        nat_div - 1
+                                    } else {
+                                        nat_div
+                                    }
+                                };
+
+                                let rem = lhs.wrapping_sub(quot.wrapping_mul(rhs));
+
+                                self.scoreboard.set(target, target_obj, rem);
                             }
                             ScoreOpKind::Min => {
                                 let mut val = self.get_score(target, target_obj).unwrap();
@@ -632,6 +844,36 @@ impl Interpreter {
 
                 Ok(None)
             }
+            Command::CloneCmd(CloneCmd { start, end, dest }) => {
+                let start = start.maybe_based(ctx.pos);
+                let end = end.maybe_based(ctx.pos);
+                let dest = dest.maybe_based(ctx.pos);
+
+                println!("{:?} {:?} {:?}", start, end, dest);
+
+
+                for (sx, dx) in (start.0..=end.0).zip(dest.0..) {
+                    for (sy, dy) in (start.1..=end.1).zip(dest.1..) {
+                        for (sz, dz) in (start.2..=end.2).zip(dest.2..) {
+                            assert!(!(
+                                (start.0..=end.0).contains(&dx) &&
+                                (start.1..=end.1).contains(&dy) &&
+                                (start.2..=end.2).contains(&dz)
+                            ));
+
+                            // TODO: This should use the set_block function
+                            let block = self.blocks.get(&(sx, sy, sz)).cloned();
+                            if let Some(block) = block {
+                                self.blocks.insert((dx, dy, dz), block);
+                            } else {
+                                self.blocks.remove(&(dx, dy, dz));
+                            }
+                        }
+                    }
+                }
+
+                Ok(None)
+            }
             Command::Fill(Fill { start, end, block }) => {
                 let start = start.maybe_based(ctx.pos);
                 let end = end.maybe_based(ctx.pos);
@@ -659,8 +901,11 @@ impl Interpreter {
                         if let DataModifySource::Value(score) = source {
                             self.set_block_data(pos, path, *score)?;
                             Ok(None)
+                        } else if let DataModifySource::ValueString(v) = source {
+                            self.set_block_data_str(pos, path, v)?;
+                            Ok(None)
                         } else {
-                            todo!()
+                            todo!("{:?}", source)
                         }
                     }
                     (DataTarget::Block(block), DataKind::Get { path, scale }) => {
@@ -670,7 +915,7 @@ impl Interpreter {
                         #[allow(clippy::float_cmp)]
                         { assert_eq!(*scale, 1.0); }
 
-                        println!("Getting block data at {:?}", pos);
+                        //println!("Getting block data at {:?}", pos);
 
                         Ok(Some(self.get_block_data(pos, path)?))
                     }
@@ -784,10 +1029,12 @@ impl Interpreter {
                                                 let pos = match target.as_str() {
                                                     "memoryptr" => &mut self.memory_ptr_pos,
                                                     "stackptr" => &mut self.stack_ptr_pos,
+                                                    "condstackptr" => &mut self.cond_stack_ptr_pos,
                                                     "frameptr" => &mut self.frame_ptr_pos,
                                                     "localptr" => &mut self.local_ptr_pos,
                                                     "globalptr" => &mut self.global_ptr_pos,
                                                     "turtle" => &mut self.turtle_pos,
+                                                    "nextchain" => &mut self.next_chain_pos,
                                                     _ => todo!("{:?}", target)
                                                 };
 
@@ -798,8 +1045,6 @@ impl Interpreter {
                                                     _ => todo!("{:?}", path)
                                                 }
                                             }
-
-                                            _ => todo!("{:?}", target)
                                         }
                                     }
                                 }
@@ -810,17 +1055,23 @@ impl Interpreter {
                     // TODO: Determine if the return value passes through
                     // TODO: What happens if the condition is false?
                     Ok(None)
-                    } else if let (Some((is_success, store_kind)), (is_unless, cond)) = (store, cnd[0]) {
+                } else if let Some((is_success, store_kind)) = store {
 
-                    assert!(cnd.len() == 1);
+                    assert!(!cnd.is_empty());
+
                     assert!(is_success);
 
-                    let val = self.check_cond(is_unless, cond);
+                    let mut val = true;
+
+                    for (is_unless, cond) in cnd.iter() {
+                        val &= self.check_cond(*is_unless, cond);
+                    }
 
                     match store_kind {
                         ExecuteStoreKind::Score { target, objective } => {
                             match target {
                                 Target::Uuid(holder) => {
+                                    println!("Storing into {}", holder);
                                     self.scoreboard.set(holder, objective, val as i32);
                                 }
                                 _ => todo!("{:?}", target),
@@ -950,9 +1201,12 @@ impl Interpreter {
             }
             */
             Command::Comment(c) if c.starts_with("!INTERPRETER: SYNC ") => {
-                //let c = c.strip_prefix("!INTERPRETER: SYNC ").unwrap();
+                let c = c.strip_prefix("!INTERPRETER: SYNC ").unwrap();
+                let (f, i) = c.split_once(' ').unwrap();
+                let f = f.parse::<usize>().unwrap();
+                let i = i.parse::<usize>().unwrap();
 
-                Err(InterpError::BreakpointHit)
+                Err(InterpError::SyncHit(f, i))
             }
             Command::Comment(c) if c == "!INTERPRETER: TODO" => {
                 Err(InterpError::EnteredTodo)
@@ -997,6 +1251,9 @@ impl Interpreter {
                         if data.contains("frameptr") {
                             self.frame_ptr_pos = pos;
                             Ok(None)
+                        } else if data.contains("condstackptr") {
+                            self.cond_stack_ptr_pos = pos;
+                            Ok(None)
                         } else if data.contains("stackptr") {
                             self.stack_ptr_pos = pos;
                             Ok(None)
@@ -1011,6 +1268,9 @@ impl Interpreter {
                             Ok(None)
                         } else if data.contains("turtle") {
                             self.turtle_pos = pos;
+                            Ok(None)
+                        } else if data.contains("nextchain") {
+                            self.next_chain_pos = pos;
                             Ok(None)
                         } else {
                             todo!()
@@ -1046,10 +1306,12 @@ impl Interpreter {
 
                 match target.as_str() {
                     "stackptr" => self.stack_ptr_pos = pos,
+                    "condstackptr" => self.cond_stack_ptr_pos = pos,
                     "memoryptr" => self.memory_ptr_pos = pos,
                     "localptr" => self.local_ptr_pos = pos,
                     "globalptr" => self.global_ptr_pos = pos,
                     "frameptr" => self.frame_ptr_pos = pos,
+                    "nextchain" => self.next_chain_pos = pos,
                     _ => todo!("{:?}", target)
                 };
 
@@ -1066,7 +1328,7 @@ impl Interpreter {
     }
 
     pub fn step(&mut self) -> Result<(), InterpError> {
-        if self.commands_run >= 60_000 {
+        if self.commands_run >= 600_000 {
             return Err(InterpError::MaxCommandsRun);
         }
 
@@ -1082,12 +1344,11 @@ impl Interpreter {
 
         let mut ctx = Context { pos: self.ctx_pos, ident: None };
 
-        self.execute_cmd_ctx(cmd, &mut ctx)?;
-
-
         // TODO: This doesn't get incremented on breakpoints
         self.commands_run += 1;
-        
+
+        self.execute_cmd_ctx(cmd, &mut ctx)?;
+
         self.finish_unwind(top_func);
 
         Ok(())
@@ -1104,8 +1365,18 @@ impl Interpreter {
                     "Executed {} commands from function '{}'",
                     self.commands_run, top_func,
                 );
+
+                if let Some(ctx_pos) = self.ctx_pos {
+                    println!("Pos was {:?}", ctx_pos);
+                    if self.trigger_chain(ctx_pos) {
+                        break;
+                    }
+                }
+
+                self.last_commands_run = self.commands_run;
                 self.commands_run = 0;
                 self.ctx_pos = None;
+
                 if let Some(n) = self.next_pos.take() {
                     eprintln!("\nNow about to execute {}", &self.program[n.0].id);
                     self.call_stack.push((n.0, n.1));
