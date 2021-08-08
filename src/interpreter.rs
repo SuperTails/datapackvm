@@ -1,19 +1,7 @@
 use crate::cir::*;
-//use crate::compile_ir::{get_index, pos_to_func_idx, OBJECTIVE};
-//use crate::Datapack;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::str::FromStr;
-
-pub fn get_index(x: i32, y: i32, z: i32) -> Result<i32, InterpError> {
-    if (0..8).contains(&x) && (0..256).contains(&y) && (0..8).contains(&z) {
-        Ok((x * 8 * 8 + y * 8 + z) * 4)
-    } else {
-        Err(InterpError::OutOfBoundsAccess(x, y, z))
-    }
-}
-
-// FIXME: Multiple conditions and a `store success` does not work like I think it does!!!
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum InterpError {
@@ -66,15 +54,15 @@ pub enum BreakKind {
 }
 
 #[derive(Default, Debug)]
-pub struct Scoreboard(pub HashMap<String, HashMap<ScoreHolder, i32>>);
+pub struct Scoreboard(pub HashMap<Objective, HashMap<ScoreHolder, i32>>);
 
 impl Scoreboard {
-    pub fn get(&self, holder: &ScoreHolder, obj: &String) -> Option<i32> {
+    pub fn get(&self, holder: &ScoreHolder, obj: &Objective) -> Option<i32> {
         let scores = self.0.get(obj)?;
         scores.get(holder).copied()
     }
 
-    pub fn set(&mut self, holder: &ScoreHolder, obj: &String, value: i32) {
+    pub fn set(&mut self, holder: &ScoreHolder, obj: &Objective, value: i32) {
         let scores = self.0.get_mut(obj).unwrap();
         scores.insert(holder.to_owned(), value);
 
@@ -185,41 +173,21 @@ impl TryFrom<&BlockSpec> for Block {
     }
 }
 
-/*
-impl FromStr for Block {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s == "minecraft:redstone_block" {
-            Ok(Block::Redstone)
-        } else if s.starts_with("minecraft:jukebox") {
-            let idx = s.find("Memory:").unwrap();
-            let rest = &s[idx + "Memory:".len()..];
-            let end_idx = rest.find('}').unwrap();
-
-            let val = rest[..end_idx].parse().unwrap();
-            Ok(Block::Jukebox(val))
-        } else if s.starts_with("minecraft:command_block") {
-            let start = s.find("{Command:\"").unwrap() + "{Command:\"".len();
-            let end = s.find("\"}").unwrap();
-            Ok(Block::Command(s[start..end].to_string()))
-        } else if s.starts_with("minecraft:chain_command_block") {
-            todo!("{:?}", s);
-        } else {
-            Ok(Block::Other(s.to_string()))
-        }
-    }
+#[derive(Debug, Clone, Default)]
+/// Represents the state of 
+struct Context {
+    pub pos: Option<(i32, i32, i32)>,
+    pub ident: Option<String>,
 }
-*/
 
 pub struct Interpreter {
-    pub scoreboard: Scoreboard,
-
-    pub(crate) call_stack: Vec<(usize, usize)>,
-    ctx_pos: Option<(i32, i32, i32)>,
     pub program: Vec<Function>,
 
-    memory: [i32; 8 * 256 * 8],
+    pub scoreboard: Scoreboard,
+
+    call_stack: Vec<(usize, usize)>,
+    ctx_pos: Option<(i32, i32, i32)>,
+
 
     blocks: HashMap<(i32, i32, i32), Block>,
 
@@ -230,28 +198,16 @@ pub struct Interpreter {
     stack_ptr_pos: (i32, i32, i32),
     cond_stack_ptr_pos: (i32, i32, i32),
 
-    ptr_pos: (i32, i32, i32),
     turtle_pos: (i32, i32, i32),
     next_chain_pos: (i32, i32, i32),
 
     next_pos: Option<(usize, usize, (i32, i32, i32))>,
-    letters: HashMap<(i32, i32, i32), char>,
+
     pub output: Vec<String>,
     pub tick: usize,
 
     pub last_commands_run: usize,
     commands_run: usize,
-
-    memory_points: HashMap<usize, BreakKind>,
-
-    /// FIXME: Add support for the *real* commands
-    stdout_buffer: String,
-}
-
-#[derive(Default, Clone)]
-struct Context {
-    pos: Option<(i32, i32, i32)>,
-    ident: Option<String>,
 }
 
 impl Interpreter {
@@ -260,14 +216,7 @@ impl Interpreter {
         self.ctx_pos = None;
     }
 
-    pub fn new_wasm(program: Vec<Function>, func_idx: usize, input: &str) -> Self {
-        let mut letters = HashMap::new();
-        for (z, letter) in input.chars().enumerate() {
-            if letter != ' ' {
-                letters.insert((-16, 16, -(z as i32)), letter);
-            }
-        }
-
+    pub fn new(program: Vec<Function>, func_idx: usize) -> Self {
         Interpreter {
             program,
             ctx_pos: None,
@@ -279,9 +228,7 @@ impl Interpreter {
             stack_ptr_pos: Default::default(),
             cond_stack_ptr_pos: Default::default(),
             global_ptr_pos: Default::default(),
-            memory: [0x55_55_55_55; 8 * 256 * 8],
             scoreboard: Scoreboard::default(),
-            ptr_pos: (0, 0, 0),
             turtle_pos: (0, 0, 0),
             next_chain_pos: (0, 0, 0),
             next_pos: None,
@@ -289,95 +236,6 @@ impl Interpreter {
             commands_run: 0,
             tick: 0,
             output: Vec::new(),
-            memory_points: HashMap::new(),
-            letters,
-            stdout_buffer: String::new(),
-        }
-
-    }
-
-    /// Does not include any intrinsics
-    pub fn new_raw(program: Vec<Function>, input: &str) -> Self {
-        let func_idx = program.len() - 1;
-
-        let mut letters = HashMap::new();
-        for (z, letter) in input.chars().enumerate() {
-            if letter != ' ' {
-                letters.insert((-16, 16, -(z as i32)), letter);
-            }
-        }
-
-        Interpreter {
-            program,
-            ctx_pos: None,
-            call_stack: vec![(func_idx, 0)],
-            blocks: HashMap::new(),
-            memory_ptr_pos: Default::default(),
-            frame_ptr_pos: Default::default(),
-            local_ptr_pos: Default::default(),
-            stack_ptr_pos: Default::default(),
-            cond_stack_ptr_pos: Default::default(),
-            global_ptr_pos: Default::default(),
-            memory: [0x55_55_55_55; 8 * 256 * 8],
-            scoreboard: Scoreboard::default(),
-            ptr_pos: (0, 0, 0),
-            turtle_pos: (0, 0, 0),
-            next_chain_pos: (0, 0, 0),
-            next_pos: None,
-            last_commands_run: 0,
-            commands_run: 0,
-            tick: 0,
-            output: Vec::new(),
-            memory_points: HashMap::new(),
-            letters,
-            stdout_buffer: String::new(),
-        }
-    }
-
-    pub fn new(datapack: Vec<Function>, start_idx: usize, input: &str) -> Self {
-        let mut letters = HashMap::new();
-        let mut z = 0;
-        let mut y = 32;
-        for letter in input.chars() {
-            match letter {
-                '\n' => {
-                    z = 0;
-                    y -= 2;
-                }
-                ' ' => {
-                    z -= 1;
-                }
-                _ => {
-                    letters.insert((-16, y, z), letter);
-                    z -= 1;
-                }
-            }
-        }
-
-        Interpreter {
-            program: datapack,
-            ctx_pos: None,
-            call_stack: vec![(start_idx, 0)],
-            blocks: HashMap::new(),
-            memory: [0; 8 * 256 * 8],
-            memory_ptr_pos: Default::default(),
-            frame_ptr_pos: Default::default(),
-            local_ptr_pos: Default::default(),
-            stack_ptr_pos: Default::default(),
-            cond_stack_ptr_pos: Default::default(),
-            global_ptr_pos: Default::default(),
-            scoreboard: Scoreboard::default(),
-            ptr_pos: (0, 0, 0),
-            turtle_pos: (0, 0, 0),
-            next_chain_pos: (0, 0, 0),
-            next_pos: None,
-            tick: 0,
-            last_commands_run: 0,
-            commands_run: 0,
-            output: Vec::new(),
-            memory_points: HashMap::new(),
-            letters,
-            stdout_buffer: String::new(),
         }
     }
 
@@ -393,14 +251,7 @@ impl Interpreter {
             .collect()
     }
 
-    /// `word_start` is in bytes, must be aligned to a multiple of 4
-    pub fn set_mem_breakpoint(&mut self, word_start: usize, kind: BreakKind) {
-        assert_eq!(word_start % 4, 0);
-
-        self.memory_points.insert(word_start / 4, kind);
-    }
-
-    pub fn set_next_pos(&mut self, func_idx: usize, pos: (i32, i32, i32)) -> Result<(), InterpError> {
+    fn set_next_pos(&mut self, func_idx: usize, pos: (i32, i32, i32)) -> Result<(), InterpError> {
         if let Some((f, _, _)) = self.next_pos {
             let att = self.program.get(func_idx).map(|f| f.id.clone());
             Err(InterpError::MultiBranch(self.program[f].id.clone(), att))
@@ -410,55 +261,6 @@ impl Interpreter {
             self.next_pos = Some((func_idx, 0, pos));
             Ok(())
         }
-    }
-
-    pub fn get_word(&self, addr: usize) -> Result<i32, InterpError> {
-        assert_eq!(addr % 4, 0);
-
-        match self.memory_points.get(&(addr / 4)) {
-            Some(BreakKind::Access) | Some(BreakKind::Read) => {
-                return Err(InterpError::BreakpointHit)
-            }
-            _ => {}
-        };
-
-        Ok(self.memory[addr / 4])
-    }
-
-    pub fn get_byte(&self, addr: usize) -> Result<u8, InterpError> {
-        let word_addr = (addr / 4) * 4;
-
-        Ok(self.get_word(word_addr)?.to_le_bytes()[addr % 4])
-    }
-
-    pub fn set_word(&mut self, value: i32, addr: usize) -> Result<(), InterpError> {
-        assert_eq!(addr % 4, 0);
-
-        match self.memory_points.get(&(addr / 4)) {
-            Some(BreakKind::Access) | Some(BreakKind::Write) => {
-                return Err(InterpError::BreakpointHit)
-            }
-            _ => {}
-        };
-
-        self.memory[addr / 4] = value;
-
-        Ok(())
-    }
-
-    pub fn set_byte(&mut self, value: u8, addr: usize) -> Result<(), InterpError> {
-        match self.memory_points.get(&(addr / 4)) {
-            Some(BreakKind::Access) | Some(BreakKind::Write) => {
-                return Err(InterpError::BreakpointHit)
-            }
-            _ => {}
-        };
-
-        let mut bytes = self.memory[addr / 4].to_le_bytes();
-        bytes[addr % 4] = value;
-        self.memory[addr / 4] = i32::from_le_bytes(bytes);
-
-        Ok(())
     }
 
     /// Runs until the program halts
@@ -478,7 +280,7 @@ impl Interpreter {
         }
     }
 
-    pub fn eval_message(&self, msg: &[TextComponent]) -> String {
+    fn eval_message(&self, msg: &[TextComponent]) -> String {
         let mut result = String::new();
         let score_getter = |name: &ScoreHolder, obj: &Objective| -> Option<i32> {
             self.scoreboard.get(name, obj)
@@ -494,7 +296,7 @@ impl Interpreter {
         self.scoreboard.get(holder, obj).ok_or_else(|| format!("read from uninitialized variable {} {}", holder, obj))
     }
 
-    pub fn check_cond(&self, is_unless: bool, cond: &ExecuteCondition) -> bool {
+    fn check_cond(&self, is_unless: bool, cond: &ExecuteCondition) -> bool {
         let result = match cond {
             ExecuteCondition::Score {
                 target: Target::Uuid(target),
@@ -531,11 +333,6 @@ impl Interpreter {
         } else {
             result
         }
-    }
-
-    fn read_mem(&self) -> Result<i32, InterpError> {
-        let index = get_index(self.ptr_pos.0, self.ptr_pos.1, self.ptr_pos.2)?;
-        self.get_word(index as usize)
     }
 
     fn set_block(&mut self, pos: (i32, i32, i32), block: &BlockSpec, mode: SetBlockKind) {
@@ -711,7 +508,7 @@ impl Interpreter {
 
     }
 
-    fn execute_cmd(&mut self, cmd: &Command) -> Result<Option<i32>, InterpError> {
+    pub fn execute_cmd(&mut self, cmd: &Command) -> Result<Option<i32>, InterpError> {
         let mut ctx = Context::default();
 
         self.execute_cmd_ctx(cmd, &mut ctx)
@@ -1327,6 +1124,7 @@ impl Interpreter {
         self.program[*top_func_idx].id.to_string()
     }
 
+    /// Executes the next command
     pub fn step(&mut self) -> Result<(), InterpError> {
         if self.commands_run >= 600_000 {
             return Err(InterpError::MaxCommandsRun);
@@ -1399,6 +1197,6 @@ impl Interpreter {
     }
 
     pub fn halted(&self) -> bool {
-        self.call_stack.last() == Some(&(0xFFFF_FFFF_FFFF_FFFF, 0)) || self.call_stack.is_empty()
+        self.call_stack.is_empty()
     }
 }

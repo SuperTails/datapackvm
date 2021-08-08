@@ -1,6 +1,7 @@
 pub use raw_text::*;
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, HashMap};
-use std::convert::TryFrom;
+use std::convert::{TryFrom, TryInto};
 use std::fmt;
 use std::ops::{RangeFrom, RangeInclusive, RangeToInclusive};
 use std::str::FromStr;
@@ -10,14 +11,6 @@ mod raw_text;
 
 
 /// The name of an entity on the scoreboard.
-///
-/// Characters not allowed:
-/// All non-printing characters
-/// whitespace
-/// '*'
-/// '@' (as the first character)
-/// '"' (technically allowed, but complicates JSON)
-/// Length limit of 40 characters
 #[derive(
     Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, serde::Serialize, serde::Deserialize,
 )]
@@ -27,6 +20,13 @@ pub struct ScoreHolder(String);
 const MAX_HOLDER_LEN: usize = 40;
 
 impl ScoreHolder {
+    /// Characters not allowed:
+    /// All non-printing characters
+    /// whitespace
+    /// '*'
+    /// '@' (as the first character)
+    /// '"' (technically allowed, but complicates JSON)
+    /// Length limit of 40 characters
     pub fn new(string: String) -> Result<Self, String> {
         if string.is_empty() {
             return Err(string);
@@ -103,11 +103,56 @@ impl AsRef<str> for ScoreHolder {
     }
 }
 
+impl Borrow<str> for ScoreHolder {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
 impl fmt::Display for ScoreHolder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+/// The name of an objective on the scoreboard
+pub struct Objective(String);
+
+impl Objective {
+    pub fn new(s: String) -> Result<Self, String> {
+        // TODO: Determine what characters are valid
+        Ok(Objective(s))
+    }
+}
+
+impl TryFrom<String> for Objective {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        Objective::new(s)
+    }
+}
+
+impl AsRef<str> for Objective {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Borrow<str> for Objective {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for Objective {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Target {
@@ -1079,39 +1124,6 @@ impl CommandParser<'_> {
         })
     }
 
-    pub fn parse_block(&mut self) -> String {
-        let start = self.tail;
-
-        let mut final_idx = None;
-
-        let mut depth = 0;
-
-        for (idx, c) in self.tail.chars().enumerate() {
-            if depth == 0 && c == ' ' {
-                final_idx = Some(idx);
-                break;
-            }
-
-            if c == '{' {
-                depth += 1;
-            }
-
-            if c == '}' {
-                depth -= 1;
-            }
-        }
-
-        let final_idx = final_idx.unwrap_or(self.tail.len());
-
-        assert_eq!(depth, 0, "{:?}", start);
-        assert_ne!(final_idx, 0, "{:?}", start);
-        
-        let result = &self.tail[..final_idx];
-        self.tail = &self.tail[final_idx..].trim();
-
-        result.to_string()
-    }
-
     pub fn parse_setblock(&mut self) -> CmdParseResult<Command> {
         let pos = self.parse_rel_pos()?;
 
@@ -1232,7 +1244,7 @@ impl CommandParser<'_> {
             Some("score") => {
                 self.next_word().unwrap();
                 let target = self.next_word()?.parse().expect("TODO:");
-                let objective = self.next_word()?.to_owned();
+                let objective = self.next_word()?.to_owned().try_into().expect("TODO:");
 
                 ExecuteStoreKind::Score { target, objective }
             }
@@ -1282,7 +1294,7 @@ impl CommandParser<'_> {
         match self.next_word()? {
             "score" => {
                 let target = self.next_word()?.parse().expect("TODO:");
-                let target_obj = self.next_word()?.to_owned();
+                let target_obj = self.next_word()?.to_owned().try_into().expect("TODO:");
                 let kind = match self.next_word()? {
                     "matches" => {
                         ExecuteCondKind::Matches(self.next_word()?.parse().expect("TODO:"))
@@ -1290,7 +1302,7 @@ impl CommandParser<'_> {
                     s => {
                         let relation = s.parse().expect("TODO:");
                         let source = self.next_word()?.parse().expect("TODO:");
-                        let source_obj = self.next_word()?.to_owned();
+                        let source_obj = self.next_word()?.to_owned().try_into().expect("TODO:");
                         ExecuteCondKind::Relation {
                             relation,
                             source,
@@ -1320,11 +1332,11 @@ impl CommandParser<'_> {
     pub fn parse_objectives(&mut self) -> CmdParseResult<Command> {
         match self.next_word()? {
             "add" => {
-                let obj = self.next_word()?.to_owned();
+                let obj = self.next_word()?.to_owned().try_into().expect("TODO:");
                 let criteria = self.next_word()?.to_owned();
                 Ok(ObjAdd { obj, criteria }.into())
             }
-            "remove" => Ok(ObjRemove(self.next_word()?.to_owned()).into()),
+            "remove" => Ok(ObjRemove(self.next_word()?.to_owned().try_into().expect("TODO:")).into()),
             nw => todo!("{:?}", nw),
         }
     }
@@ -1342,13 +1354,13 @@ impl CommandParser<'_> {
 
     pub fn parse_scoreboard_get(&mut self) -> CmdParseResult<Command> {
         let target = self.next_word()?.parse().expect("TODO:");
-        let target_obj = self.next_word()?.to_owned();
+        let target_obj = self.next_word()?.to_owned().try_into().expect("TODO:");
         Ok(ScoreGet { target, target_obj }.into())
     }
 
     pub fn parse_scoreboard_set(&mut self) -> CmdParseResult<Command> {
         let target = self.next_word()?.parse().expect("TODO:");
-        let target_obj = self.next_word()?.to_owned();
+        let target_obj = self.next_word()?.to_owned().try_into().expect("TODO:");
 
         let score = self.next_word()?;
         let score = score.parse::<i32>().unwrap_or_else(|e| panic!("TODO: {:?} {}", e, score));
@@ -1363,7 +1375,7 @@ impl CommandParser<'_> {
 
     pub fn parse_scoreboard_add(&mut self, is_remove: bool) -> CmdParseResult<Command> {
         let target = self.next_word()?.parse().expect("TODO:");
-        let target_obj = self.next_word()?.to_owned();
+        let target_obj = self.next_word()?.to_owned().try_into().expect("TODO:");
         let score = self.next_word()?.parse::<i32>().unwrap();
         let score = if is_remove { -score } else { score };
         Ok(ScoreAdd {
@@ -1376,10 +1388,10 @@ impl CommandParser<'_> {
 
     pub fn parse_operation(&mut self) -> CmdParseResult<Command> {
         let target = self.next_word()?.parse().expect("TODO:");
-        let target_obj = self.next_word()?.to_owned();
+        let target_obj = self.next_word()?.to_owned().try_into().expect("TODO:");
         let kind = self.next_word()?.parse().expect("TODO:");
         let source = self.next_word()?.parse().expect("TODO:");
-        let source_obj = self.next_word()?.to_owned();
+        let source_obj = self.next_word()?.to_owned().try_into().expect("TODO:");
         Ok(ScoreOp {
             target,
             target_obj,
@@ -1888,8 +1900,6 @@ impl fmt::Display for SetBlockKind {
         }
     }
 }
-
-pub type Objective = String;
 
 /* Scoreboard (players functions)
 
