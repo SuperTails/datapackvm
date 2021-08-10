@@ -198,7 +198,6 @@ pub struct Interpreter {
     global_ptr_pos: (i32, i32, i32),
     frame_ptr_pos: (i32, i32, i32),
     stack_ptr_pos: (i32, i32, i32),
-    cond_stack_ptr_pos: (i32, i32, i32),
 
     turtle_pos: (i32, i32, i32),
     next_chain_pos: (i32, i32, i32),
@@ -218,17 +217,27 @@ impl Interpreter {
         self.ctx_pos = None;
     }
 
-    pub fn new(program: Vec<Function>, func_idx: usize) -> Self {
+    pub fn new_at_id(program: Vec<Function>, start_func_id: &FunctionIdent) -> Self {
+        let start_func_idx = program
+            .iter()
+            .enumerate()
+            .find(|(_, f)| &f.id == start_func_id )
+            .unwrap()
+            .0;
+        
+        Self::new(program, start_func_idx)
+    }
+
+    pub fn new(program: Vec<Function>, start_func_idx: usize) -> Self {
         Interpreter {
             program,
             ctx_pos: None,
-            call_stack: vec![(func_idx, 0)],
+            call_stack: vec![(start_func_idx, 0)],
             blocks: HashMap::new(),
             memory_ptr_pos: Default::default(),
             frame_ptr_pos: Default::default(),
             local_ptr_pos: Default::default(),
             stack_ptr_pos: Default::default(),
-            cond_stack_ptr_pos: Default::default(),
             global_ptr_pos: Default::default(),
             scoreboard: Scoreboard::default(),
             turtle_pos: (0, 0, 0),
@@ -436,7 +445,6 @@ impl Interpreter {
                     "@e[tag=frameptr]" => self.frame_ptr_pos,
                     "@e[tag=globalptr]" => self.global_ptr_pos,
                     "@e[tag=stackptr]" => self.stack_ptr_pos,
-                    "@e[tag=condstackptr]" => self.cond_stack_ptr_pos,
                     "@e[tag=turtle]" => self.turtle_pos,
                     "@e[tag=nextchain]" => self.next_chain_pos,
                     t => todo!("{:?}", t),
@@ -828,7 +836,6 @@ impl Interpreter {
                                                 let pos = match target.as_str() {
                                                     "memoryptr" => &mut self.memory_ptr_pos,
                                                     "stackptr" => &mut self.stack_ptr_pos,
-                                                    "condstackptr" => &mut self.cond_stack_ptr_pos,
                                                     "frameptr" => &mut self.frame_ptr_pos,
                                                     "localptr" => &mut self.local_ptr_pos,
                                                     "globalptr" => &mut self.global_ptr_pos,
@@ -1050,9 +1057,6 @@ impl Interpreter {
                         if data.contains("frameptr") {
                             self.frame_ptr_pos = pos;
                             Ok(None)
-                        } else if data.contains("condstackptr") {
-                            self.cond_stack_ptr_pos = pos;
-                            Ok(None)
                         } else if data.contains("stackptr") {
                             self.stack_ptr_pos = pos;
                             Ok(None)
@@ -1105,7 +1109,6 @@ impl Interpreter {
 
                 match target.as_str() {
                     "stackptr" => self.stack_ptr_pos = pos,
-                    "condstackptr" => self.cond_stack_ptr_pos = pos,
                     "memoryptr" => self.memory_ptr_pos = pos,
                     "localptr" => self.local_ptr_pos = pos,
                     "globalptr" => self.global_ptr_pos = pos,
