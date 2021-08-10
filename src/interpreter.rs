@@ -1,4 +1,6 @@
-use crate::cir::*;
+use datapack_common::functions::command::*;
+use datapack_common::functions::raw_text::TextComponent;
+use datapack_common::functions::*;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::str::FromStr;
@@ -13,7 +15,7 @@ pub enum InterpError {
     BreakpointHit,
     SyncHit(usize, usize),
     InvalidBranch(usize),
-    MultiBranch(FunctionId, Option<FunctionId>),
+    MultiBranch(FunctionIdent, Option<FunctionIdent>),
     NoBlockData(i32, i32, i32, String),
 }
 
@@ -314,11 +316,11 @@ impl Interpreter {
                         let source = self.get_score(source, source_obj).unwrap();
 
                         match relation {
-                            Relation::LessThan => target < source,
-                            Relation::LessThanEq => target <= source,
-                            Relation::Eq => target == source,
-                            Relation::GreaterThan => target > source,
-                            Relation::GreaterThanEq => target >= source,
+                            ScoreboardComparison::Less => target < source,
+                            ScoreboardComparison::LessOrEqual => target <= source,
+                            ScoreboardComparison::Equal => target == source,
+                            ScoreboardComparison::Greater => target > source,
+                            ScoreboardComparison::GreaterOrEqual => target >= source,
                         }
                     }
                     ExecuteCondKind::Matches(m) => m.contains(target),
@@ -414,7 +416,7 @@ impl Interpreter {
         }
     }
 
-    fn get_func_idx(&self, id: &FunctionId) -> usize {
+    fn get_func_idx(&self, id: &FunctionIdent) -> usize {
         let mut idx = None;
         for (i, f) in self.program.iter().enumerate() {
             if &f.id == id {
@@ -619,8 +621,8 @@ impl Interpreter {
                 Ok(None)
             }
             Command::FuncCall(FuncCall { id }) => {
-                if id.name == "stdout:putc" {
-                    todo!();
+                //if id"stdout:putc" {
+                //    todo!();
                     /*
                     let c = self.get_rust_score(&ScoreHolder::new("%%temp0_putc".into()).unwrap()).unwrap();
                     let c = char::from(u8::try_from(c).unwrap_or_else(|_| panic!("invalid argument to stdout:putc {}", c)));
@@ -634,10 +636,10 @@ impl Interpreter {
                         panic!("invalid argument to stdout:putc `{}`", c)
                     }
                     */
-                } else {
-                    let called_idx = self.program.iter().enumerate().find(|(_, f)| &f.id == id).unwrap_or_else(|| todo!("{:?}", id)).0;
-                    self.call_stack.push((called_idx, 0));
-                }
+                //} else {
+                let called_idx = self.program.iter().enumerate().find(|(_, f)| &f.id == id).unwrap_or_else(|| todo!("{:?}", id)).0;
+                self.call_stack.push((called_idx, 0));
+                //}
 
                 Ok(None)
             }
@@ -1080,7 +1082,7 @@ impl Interpreter {
                 }
             }
             Command::ObjAdd(ObjAdd { obj, criteria }) => {
-                if criteria == "dummy" {
+                if criteria == &ObjectiveCriterion::Dummy {
                     self.scoreboard.0.insert(obj.clone(), HashMap::new());
                     Ok(None)
                 } else {

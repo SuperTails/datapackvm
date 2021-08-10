@@ -1,4 +1,3 @@
-pub mod cir;
 pub mod interpreter;
 
 pub use interpreter::Interpreter;
