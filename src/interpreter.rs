@@ -792,9 +792,7 @@ impl Interpreter {
 
                         // The number in the file is *always* 1.0
                         #[allow(clippy::float_cmp)]
-                        { assert!(matches!(scale.0, None | Some(1.0))); }
-
-                        //println!("Getting block data at {:?}", pos);
+                        { assert!(scale.0 == None || scale.0 == Some(1.0)); }
 
                         Ok(Some(self.get_block_data(pos, path)?))
                     }
@@ -885,11 +883,19 @@ impl Interpreter {
 
                             match store {
                                 ExecuteSubCommand::StoreScore(StoreScore { is_success, target, target_obj, }) => {
+                                    if *is_success {
+                                        todo!()
+                                    }
+
                                     let target = get_target_name(target).unwrap();
 
-                                    self.scoreboard.set(target, &target_obj, val);
+                                    self.scoreboard.set(target, target_obj, val);
                                 }
                                 ExecuteSubCommand::StoreStorage(StoreStorage { is_success, target, path, ty, scale }) => {
+                                    if *is_success {
+                                        todo!()
+                                    }
+
                                     // The number in the file is *always* 1.0
                                     #[allow(clippy::float_cmp)]
                                     { assert_eq!(*scale, 1.0); }
@@ -898,7 +904,7 @@ impl Interpreter {
                                         DataTarget::Block(pos) => {
                                             assert!(ty == "int");
 
-                                            let pos = maybe_based(&pos, ctx.pos);
+                                            let pos = maybe_based(pos, ctx.pos);
 
                                             self.set_block_data_int(pos, path, val)?;
                                         }
@@ -1002,7 +1008,7 @@ impl Interpreter {
                     }
 
                     Ok(None)*/
-                    todo!()
+                    todo!("{:?}", cond)
                 } else if c.contains("!INTERPRETER") {
                     todo!("{}", c)
                 } else {
