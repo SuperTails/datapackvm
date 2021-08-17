@@ -1,9 +1,52 @@
 use datapack_common::functions::command::*;
 use datapack_common::functions::raw_text::TextComponent;
 use datapack_common::functions::*;
+use datapack_common::functions::command_components::*;
+use datapack_common::functions::command::execute_sub_commands::*;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::str::FromStr;
+
+fn get_name(target: &ScoreboardTarget) -> Option<&ScoreHolder> {
+    match target {
+        ScoreboardTarget::Target(target) => get_target_name(target),
+        ScoreboardTarget::Asterisk => None,
+    }
+}
+
+fn get_target_name(target: &Target) -> Option<&ScoreHolder> {
+    match target {
+        Target::Name(name) => Some(name),
+        Target::Selector(_) => None
+    }
+}
+
+fn maybe_based(pos: &RelBlockPos, base: Option<(i32, i32, i32)>) -> (i32, i32, i32) {
+    match pos {
+        RelBlockPos {
+            x: Coord { value: x, kind: CoordKind::Absolute },
+            y: Coord { value: y, kind: CoordKind::Absolute },
+            z: Coord { value: z, kind: CoordKind::Absolute },
+        } => {
+            (*x, *y, *z)
+        }
+        RelBlockPos { x, y, z } => {
+            let base = base.unwrap();
+            let x = calc_coord(x, base.0);
+            let y = calc_coord(y, base.1);
+            let z = calc_coord(z, base.2);
+            (x, y, z)
+        }
+    }
+}
+
+fn calc_coord(coord: &Coord, base: i32) -> i32 {
+    match coord.kind {
+        CoordKind::Absolute => coord.value,
+        CoordKind::Relative => coord.value + base,
+        CoordKind::Local => todo!(),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum InterpError {
@@ -67,7 +110,6 @@ impl Scoreboard {
     pub fn set(&mut self, holder: &ScoreHolder, obj: &Objective, value: i32) {
         let scores = self.0.get_mut(obj).unwrap();
         scores.insert(holder.to_owned(), value);
-
     }
 }
 
@@ -119,13 +161,15 @@ impl TryFrom<&BlockSpec> for Block {
     type Error = String;
 
     fn try_from(block: &BlockSpec) -> Result<Self, Self::Error> {
-        match block.id.as_str() {
+        match block.id.as_ref() {
             "minecraft:redstone_block" => Ok(Block::Redstone),
             "minecraft:jukebox" => {
                 assert!(block.state.is_empty());
 
-                let idx = block.nbt.find("Memory:").unwrap();
-                let rest = &block.nbt[idx + "Memory:".len()..];
+                let nbt = block.nbt.to_string();
+
+                let idx = nbt.find("Memory:").unwrap();
+                let rest = &nbt[idx + "Memory:".len()..];
                 let end_idx = rest.find('}').unwrap();
 
                 let val = rest[..end_idx].parse().unwrap();
@@ -135,10 +179,12 @@ impl TryFrom<&BlockSpec> for Block {
                 let conditional = block.state.get("conditional").unwrap_or("false").parse::<bool>().unwrap();
                 let facing = block.state.get("facing").unwrap_or("north").parse::<Facing>().unwrap();
 
-                let command = if let Some(cmd_start) = block.nbt.find("{Command:\"") {
+                let nbt = block.nbt.to_string();
+
+                let command = if let Some(cmd_start) = nbt.find("{Command:\"") {
                     let start = cmd_start + "{Command:\"".len();
-                    let end = block.nbt.find("\"}").unwrap();
-                    block.nbt[start..end].to_string()
+                    let end = nbt.find("\"}").unwrap();
+                    nbt[start..end].to_string()
                 } else {
                     String::new()
                 };
@@ -154,10 +200,12 @@ impl TryFrom<&BlockSpec> for Block {
                 let conditional = block.state.get("conditional").unwrap_or("false").parse::<bool>().unwrap();
                 let facing = block.state.get("facing").unwrap_or("north").parse::<Facing>().unwrap();
 
-                let command = if let Some(cmd_start) = block.nbt.find("{Command:\"") {
+                let nbt = block.nbt.to_string();
+
+                let command = if let Some(cmd_start) = nbt.find("{Command:\"") {
                     let start = cmd_start + "{Command:\"".len();
-                    let end = block.nbt.find("\"}").unwrap();
-                    block.nbt[start..end].to_string()
+                    let end = nbt.find("\"}").unwrap();
+                    nbt[start..end].to_string()
                 } else {
                     String::new()
                 };
@@ -176,7 +224,6 @@ impl TryFrom<&BlockSpec> for Block {
 }
 
 #[derive(Debug, Clone, Default)]
-/// Represents the state of 
 struct Context {
     pub pos: Option<(i32, i32, i32)>,
     pub ident: Option<String>,
@@ -307,47 +354,48 @@ impl Interpreter {
         self.scoreboard.get(holder, obj).ok_or_else(|| format!("read from uninitialized variable {} {}", holder, obj))
     }
 
-    fn check_cond(&self, is_unless: bool, cond: &ExecuteCondition) -> bool {
-        let result = match cond {
-            ExecuteCondition::Score {
-                target: Target::Uuid(target),
-                target_obj,
-                kind,
-            } => {
-                let target = self.get_score(target, target_obj).unwrap();
-
-                match kind {
-                    ExecuteCondKind::Relation {
-                        relation,
-                        source: Target::Uuid(source),
-                        source_obj,
-                    } => {
-                        let source = self.get_score(source, source_obj).unwrap();
-
-                        match relation {
-                            ScoreboardComparison::Less => target < source,
-                            ScoreboardComparison::LessOrEqual => target <= source,
-                            ScoreboardComparison::Equal => target == source,
-                            ScoreboardComparison::Greater => target > source,
-                            ScoreboardComparison::GreaterOrEqual => target >= source,
-                        }
-                    }
-                    ExecuteCondKind::Matches(m) => m.contains(target),
-                    _ => todo!("{:?}", kind),
-                }
+    fn check_cond(&self, subcmd: &ExecuteSubCommand) -> bool {
+        match subcmd {
+            ExecuteSubCommand::IfScoreMatches(cond) => {
+                self.check_if_score_matches(cond)
             }
-            _ => todo!("{:?}", cond),
-        };
-
-        if is_unless {
-            !result
-        } else {
-            result
+            ExecuteSubCommand::IfScoreRelation(cond) => {
+                self.check_if_score_relation(cond)
+            }
+            ExecuteSubCommand::IfBlock(cond) => {
+                self.check_if_block(cond)
+            }
+            _ => todo!(),
         }
     }
 
+    fn check_if_score_matches(&self, cond: &IfScoreMatches) -> bool {
+        let target = get_target_name(&cond.target).unwrap();
+
+        let score = self.get_score(target, &cond.target_obj).unwrap();
+
+        let result = cond.range.contains(score);
+
+        if cond.is_unless { !result } else { result }
+    }
+
+    fn check_if_score_relation(&self, cond: &IfScoreRelation) -> bool {
+        let lhs = self.get_score(get_target_name(&cond.target).unwrap(), &cond.target_obj).unwrap();
+        let rhs = self.get_score(get_target_name(&cond.source).unwrap(), &cond.source_obj).unwrap();
+
+        let result = cond.relation.evaluate(lhs, rhs);
+
+        if cond.is_unless { !result } else { result }
+    }
+
+    fn check_if_block(&self, _cond: &IfBlock) -> bool {
+        todo!()
+    }
+
     fn set_block(&mut self, pos: (i32, i32, i32), block: &BlockSpec, mode: SetBlockKind) {
-        if block.id == "minecraft:air" {
+        use datapack_common::functions::command::commands::FuncCall;
+
+        if block.id.as_ref() == "minecraft:air" {
             self.blocks.remove(&pos);
         } else {
             println!("{:?}", pos);
@@ -398,6 +446,8 @@ impl Interpreter {
 
     /// returns true if execution should continue
     fn trigger_at(&mut self, pos: (i32, i32, i32)) -> bool {
+        use datapack_common::functions::command::commands::FuncCall;
+
         if let Some(Block::Command(CommandBlock { kind: CmdBlockKind::Chain, command, .. })) = self.blocks.get(&pos) {
             if !command.is_empty() {
                 let c = command.parse::<Command>().unwrap();
@@ -502,7 +552,21 @@ impl Interpreter {
         }
     }
 
-    fn set_block_data(&mut self, pos: (i32, i32, i32), path: &str, value: i32) -> Result<(), InterpError> {
+    fn set_block_data(&mut self, pos: (i32, i32, i32), path: &str, value: &SNbt) -> Result<(), InterpError> {
+        let value = value.to_string();
+
+        if let Ok(value) = value.parse::<i32>() {
+            self.set_block_data_int(pos, path, value)
+        } else if let Some(s) = value.strip_prefix('"') {
+            let s = s.strip_suffix('"').unwrap();
+
+            self.set_block_data_str(pos, path, s)
+        } else {
+            todo!("{:?}", value);
+        }
+    }
+
+    fn set_block_data_int(&mut self, pos: (i32, i32, i32), path: &str, value: i32) -> Result<(), InterpError> {
         match self.blocks.get_mut(&pos) {
             Some(Block::Jukebox(v)) => {
                 if path == "RecordItem.tag.Memory" {
@@ -525,6 +589,8 @@ impl Interpreter {
     }
 
     fn execute_cmd_ctx(&mut self, cmd: &Command, ctx: &mut Context) -> Result<Option<i32>, InterpError> {
+        use datapack_common::functions::command::commands::*;
+
         //println!("{}", cmd);
         /*if !self
             .call_stack
@@ -539,91 +605,104 @@ impl Interpreter {
                 // TODO:
                 match rule.as_str() {
                     "maxCommandChainLength" => {
-                        assert!(value.is_none());
+                        assert!(value.0.is_none());
 
                         Ok(Some(600_000))
                     }
                     _ => todo!("{} {:?}", rule, value)
                 }
             }
-            Command::ScoreAdd(ScoreAdd { target: Target::Uuid(target), target_obj, score }) => {
+            Command::ScoreAdd(ScoreAdd { target, target_obj, score, remove }) => {
+                let target = get_name(target).unwrap();
+
                 let mut lhs = self.get_score(target, target_obj).unwrap();
-                lhs = lhs.wrapping_add(*score);
+
+                if *remove {
+                    lhs = lhs.wrapping_sub(*score);
+                } else {
+                    lhs = lhs.wrapping_add(*score);
+                }
+
                 self.scoreboard.set(target, target_obj, lhs);
 
                 Ok(None)
             }
-            Command::ScoreOp(ScoreOp { target, target_obj, kind, source, source_obj }) => {
-                if let Target::Uuid(target) = target {
-                    if let Target::Uuid(source) = source {
-                        let rhs = self.get_score(source, source_obj).unwrap();
+            Command::ScoreOp(ScoreOp { target, target_obj, op, source, source_obj }) => {
+                let target = get_name(target).unwrap();
+                let source = get_name(source).unwrap();
 
-                        match kind {
-                            ScoreOpKind::Assign => {
-                                self.scoreboard.set(target, target_obj, rhs);
-                            }
-                            ScoreOpKind::AddAssign => {
-                                let mut val = self.get_score(target, target_obj).unwrap();
-                                val = val.wrapping_add(rhs);
-                                self.scoreboard.set(target, target_obj, val);
-                            }
-                            ScoreOpKind::SubAssign => {
-                                let mut val = self.get_score(target, target_obj).unwrap();
-                                val = val.wrapping_sub(rhs);
-                                self.scoreboard.set(target, target_obj, val);
-                            }
-                            ScoreOpKind::MulAssign => {
-                                let mut val = self.get_score(target, target_obj).unwrap();
-                                val = val.wrapping_mul(rhs);
-                                self.scoreboard.set(target, target_obj, val);
-                            }
-                            ScoreOpKind::DivAssign => {
-                                let lhs = self.get_score(target, target_obj).unwrap();
+                let rhs = self.get_score(source, source_obj).unwrap();
 
-                                // Minecraft div rounds towards -infinity
-                                let val = if (lhs >= 0) == (rhs >= 0) {
-                                    lhs.wrapping_div(rhs)
-                                } else {
-                                    let nat_div = lhs / rhs;
-                                    if lhs != nat_div * rhs {
-                                        nat_div - 1
-                                    } else {
-                                        nat_div
-                                    }
-                                };
-
-                                self.scoreboard.set(target, target_obj, val);
-                            }
-                            ScoreOpKind::ModAssign => {
-                                let lhs = self.get_score(target, target_obj).unwrap();
-
-                                let quot = if (lhs >= 0) == (rhs >= 0) {
-                                    lhs.wrapping_div(rhs)
-                                } else {
-                                    let nat_div = lhs / rhs;
-                                    if lhs != nat_div * rhs {
-                                        nat_div - 1
-                                    } else {
-                                        nat_div
-                                    }
-                                };
-
-                                let rem = lhs.wrapping_sub(quot.wrapping_mul(rhs));
-
-                                self.scoreboard.set(target, target_obj, rem);
-                            }
-                            ScoreOpKind::Min => {
-                                let mut val = self.get_score(target, target_obj).unwrap();
-                                val = val.min(rhs);
-                                self.scoreboard.set(target, target_obj, val);
-                            }
-                            _ => todo!("{}", kind)
-                        }
-                    } else {
-                        todo!("{}", source)
+                match op {
+                    ScoreOpKind::Assign => {
+                        self.scoreboard.set(target, target_obj, rhs);
                     }
-                } else {
-                    todo!("{}", target)
+                    ScoreOpKind::Add => {
+                        let mut val = self.get_score(target, target_obj).unwrap();
+                        val = val.wrapping_add(rhs);
+                        self.scoreboard.set(target, target_obj, val);
+                    }
+                    ScoreOpKind::Sub => {
+                        let mut val = self.get_score(target, target_obj).unwrap();
+                        val = val.wrapping_sub(rhs);
+                        self.scoreboard.set(target, target_obj, val);
+                    }
+                    ScoreOpKind::Mul => {
+                        let mut val = self.get_score(target, target_obj).unwrap();
+                        val = val.wrapping_mul(rhs);
+                        self.scoreboard.set(target, target_obj, val);
+                    }
+                    ScoreOpKind::Div => {
+                        let lhs = self.get_score(target, target_obj).unwrap();
+
+                        // Minecraft div rounds towards -infinity
+                        let val = if (lhs >= 0) == (rhs >= 0) {
+                            lhs.wrapping_div(rhs)
+                        } else {
+                            let nat_div = lhs / rhs;
+                            if lhs != nat_div * rhs {
+                                nat_div - 1
+                            } else {
+                                nat_div
+                            }
+                        };
+
+                        self.scoreboard.set(target, target_obj, val);
+                    }
+                    ScoreOpKind::Mod => {
+                        let lhs = self.get_score(target, target_obj).unwrap();
+
+                        let quot = if (lhs >= 0) == (rhs >= 0) {
+                            lhs.wrapping_div(rhs)
+                        } else {
+                            let nat_div = lhs / rhs;
+                            if lhs != nat_div * rhs {
+                                nat_div - 1
+                            } else {
+                                nat_div
+                            }
+                        };
+
+                        let rem = lhs.wrapping_sub(quot.wrapping_mul(rhs));
+
+                        self.scoreboard.set(target, target_obj, rem);
+                    }
+                    ScoreOpKind::Min => {
+                        let mut val = self.get_score(target, target_obj).unwrap();
+                        val = val.min(rhs);
+                        self.scoreboard.set(target, target_obj, val);
+                    }
+                    ScoreOpKind::Max => {
+                        let mut val = self.get_score(target, target_obj).unwrap();
+                        val = val.max(rhs);
+                        self.scoreboard.set(target, target_obj, val);
+                    }
+                    ScoreOpKind::Swap => {
+                        let lhs = self.get_score(target, target_obj).unwrap();
+
+                        self.scoreboard.set(source, source_obj, lhs);
+                        self.scoreboard.set(target, target_obj, rhs);
+                    }
                 }
 
                 Ok(None)
@@ -651,10 +730,10 @@ impl Interpreter {
 
                 Ok(None)
             }
-            Command::CloneCmd(CloneCmd { start, end, dest }) => {
-                let start = start.maybe_based(ctx.pos);
-                let end = end.maybe_based(ctx.pos);
-                let dest = dest.maybe_based(ctx.pos);
+            Command::Clone(Clone { start, end, dest }) => {
+                let start = maybe_based(start, ctx.pos);
+                let end = maybe_based(end, ctx.pos);
+                let dest = maybe_based(dest, ctx.pos);
 
                 println!("{:?} {:?} {:?}", start, end, dest);
 
@@ -681,82 +760,85 @@ impl Interpreter {
 
                 Ok(None)
             }
-            Command::Fill(Fill { start, end, block }) => {
-                let start = start.maybe_based(ctx.pos);
-                let end = end.maybe_based(ctx.pos);
+            Command::Fill(Fill { start, end, block, place_kind }) => {
+                let start = maybe_based(start, ctx.pos);
+                let end = maybe_based(end, ctx.pos);
 
                 assert!(start.0 <= end.0);
                 assert!(start.1 <= end.1);
                 assert!(start.2 <= end.2);
 
+                let kind = match place_kind {
+                    FillBlockKind::Destroy => SetBlockKind::Destroy,
+                    FillBlockKind::Replace => SetBlockKind::Replace,
+                    _ => todo!("{:?}", place_kind),
+                };
+
                 for x in start.0..=end.0 {
                     for y in start.1..=end.1 {
                         for z in start.2..=end.2 {
                             // TODO: Kind??
-                            self.set_block((x, y, z), block, SetBlockKind::Replace)
+                            self.set_block((x, y, z), block, kind)
                         }
                     }
                 } 
 
                 Ok(None)
             }
-            Command::Data(Data { target, kind }) => {
-                match (target, kind) {
-                    (DataTarget::Block(block), DataKind::Modify { path, kind: DataModifyKind::Set, source }) => {
-                        let pos = block.maybe_based(ctx.pos);
-
-                        if let DataModifySource::Value(score) = source {
-                            self.set_block_data(pos, path, *score)?;
-                            Ok(None)
-                        } else if let DataModifySource::ValueString(v) = source {
-                            self.set_block_data_str(pos, path, v)?;
-                            Ok(None)
-                        } else {
-                            todo!("{:?}", source)
-                        }
-                    }
-                    (DataTarget::Block(block), DataKind::Get { path, scale }) => {
-                        let pos = block.maybe_based(ctx.pos);
+            Command::DataGet(DataGet { target, path, scale }) => {
+                match target {
+                    DataTarget::Block(block) => {
+                        let pos = maybe_based(block, ctx.pos);
 
                         // The number in the file is *always* 1.0
                         #[allow(clippy::float_cmp)]
-                        { assert_eq!(*scale, 1.0); }
+                        { assert!(matches!(scale.0, None | Some(1.0))); }
 
                         //println!("Getting block data at {:?}", pos);
 
                         Ok(Some(self.get_block_data(pos, path)?))
                     }
-                    _ => todo!("{:?} {:?}", target, kind),
+                    _ => todo!("{:?}", target)
+                }
+            }
+            Command::DataModify(DataModify { target, path, kind }) => {
+                use datapack_common::functions::command::data_modify_kinds::Set;
+
+                match target {
+                    DataTarget::Block(block) => {
+                        let pos = maybe_based(block, ctx.pos);
+
+                        if let DataModifyKind::Set(Set { value }) = kind {
+                            self.set_block_data(pos, path, value)?;
+                            Ok(None)
+                        } else {
+                            todo!("{:?}", kind)
+                        }
+                    }
+                    _ => todo!(),
                 }
             }
             Command::ScoreSet(ScoreSet { target, target_obj, score }) => {
-                match target {
-                    Target::Uuid(target) => {
-                        self.scoreboard.set(target, target_obj, *score);
-                    }
-                    _ => todo!("{:?}", target)
-                }
+                let target = get_name(target).unwrap();
+
+                self.scoreboard.set(target, target_obj, *score);
 
                 Ok(None)
             }
             Command::ScoreGet(ScoreGet { target, target_obj }) => {
-                match target {
-                    Target::Uuid(holder) => {
-                        Ok(Some(self.scoreboard.get(holder, target_obj).unwrap_or_else(|| panic!("{:?} {:?}", holder, target_obj))))
-                    }
-                    _ => todo!("{:?}", target)
-                }
+                let target = get_name(target).unwrap();
+
+                Ok(Some(self.scoreboard.get(target, target_obj).unwrap_or_else(|| panic!("{:?} {:?}", target, target_obj))))
             }
-            Command::Tellraw(b) => {
-                let Tellraw { message, target: _target } = &**b;
-                let msg = self.eval_message(&message);
+            Command::Tellraw(Tellraw { message, target: _target }) => {
+                let msg = self.eval_message(&message.components);
                 println!("\n{}\n", msg);
                 self.output.push(msg);
 
                 Ok(None)
             }
             Command::SetBlock(SetBlock { pos, block, kind }) => {
-                let pos = pos.maybe_based(ctx.pos);
+                let pos = maybe_based(pos, ctx.pos);
 
                 self.set_block(pos, block, *kind);
 
@@ -769,91 +851,88 @@ impl Interpreter {
 
                 let mut cnd = Vec::new();
 
-                for subcmd in subcommands.iter() {
+                for subcmd in subcommands.0.iter() {
                     match subcmd {
                         // TODO: DETERMINE HOW THIS INTERACTS WITH OTHER SELECTORS
-                        ExecuteSubCmd::Condition { is_unless, cond } => {
-                            cnd.push((*is_unless, cond));
+                        ExecuteSubCommand::IfScoreMatches { .. } |
+                        ExecuteSubCommand::IfScoreRelation { .. } |
+                        ExecuteSubCommand::IfBlock { .. } => {
+                            cnd.push(subcmd);
                         }
-                        ExecuteSubCmd::At { target } => {
+                        ExecuteSubCommand::At(At { target }) => {
                             ctx.pos = Some(self.get_pos(target));
                         }
-                        ExecuteSubCmd::As { target } => {
+                        ExecuteSubCommand::As(As { target }) => {
                             ctx.ident = Some(self.get_ident(target));
                         }
-                        ExecuteSubCmd::Store { is_success, kind } => {
+                        ExecuteSubCommand::StoreScore(..) |
+                        ExecuteSubCommand::StoreStorage(..) => {
                             assert!(store.is_none());
-                            store = Some((*is_success, kind));
+                            store = Some(subcmd);
                         }
                         _ => todo!("{} ({:?})", cmd, subcmd),
                     }
                 }
 
-                if let Some(run) = run {
-                    let do_run = cnd.into_iter().all(|(is_unless, cond)| self.check_cond(is_unless, cond));
+                if let Some(run) = run.0.as_deref() {
+                    let do_run = cnd.into_iter().all(|cond| self.check_cond(cond));
 
                     if do_run {
                         let val = self.execute_cmd_ctx(run, &mut ctx)?;
 
-                        if let Some((is_success, kind)) = store {
+                        if let Some(store) = store {
                             let val = val.unwrap();
 
-                            if is_success {
-                                todo!()
-                            } else {
-                                match kind {
-                                    ExecuteStoreKind::Score { target, objective } => {
-                                        match target {
-                                            Target::Uuid(holder) => {
-                                                self.scoreboard.set(holder, objective, val);
-                                            }
-                                            _ => todo!("{:?}", target)
+                            match store {
+                                ExecuteSubCommand::StoreScore(StoreScore { is_success, target, target_obj, }) => {
+                                    let target = get_target_name(target).unwrap();
+
+                                    self.scoreboard.set(target, &target_obj, val);
+                                }
+                                ExecuteSubCommand::StoreStorage(StoreStorage { is_success, target, path, ty, scale }) => {
+                                    // The number in the file is *always* 1.0
+                                    #[allow(clippy::float_cmp)]
+                                    { assert_eq!(*scale, 1.0); }
+
+                                    match target {
+                                        DataTarget::Block(pos) => {
+                                            assert!(ty == "int");
+
+                                            let pos = maybe_based(&pos, ctx.pos);
+
+                                            self.set_block_data_int(pos, path, val)?;
                                         }
-                                    }
-                                    ExecuteStoreKind::Data { target, path, ty, scale } => {
-                                        // The number in the file is *always* 1.0
-                                        #[allow(clippy::float_cmp)]
-                                        { assert_eq!(*scale, 1.0); }
+                                        DataTarget::Entity(target) => {
+                                            assert!(ty == "double");
 
-                                        match target {
-                                            DataTarget::Block(pos) => {
-                                                assert!(ty == "int");
-
-                                                let pos = pos.maybe_based(ctx.pos);
-
-                                                self.set_block_data(pos, path, val)?;
-                                            }
-                                            DataTarget::Entity(target) => {
-                                                assert!(ty == "double");
-
-                                                let target = match target {
-                                                    Target::Selector(Selector { var: SelectorVariable::ThisEntity, .. }) => {
-                                                        ctx.ident.as_ref().unwrap()
-                                                    }
-                                                    _ => todo!("{:?}", target)
-                                                };
-
-                                                let pos = match target.as_str() {
-                                                    "memoryptr" => &mut self.memory_ptr_pos,
-                                                    "stackptr" => &mut self.stack_ptr_pos,
-                                                    "frameptr" => &mut self.frame_ptr_pos,
-                                                    "localptr" => &mut self.local_ptr_pos,
-                                                    "globalptr" => &mut self.global_ptr_pos,
-                                                    "turtle" => &mut self.turtle_pos,
-                                                    "nextchain" => &mut self.next_chain_pos,
-                                                    _ => todo!("{:?}", target)
-                                                };
-
-                                                match path.as_str() {
-                                                    "Pos[0]" => pos.0 = val,
-                                                    "Pos[1]" => pos.1 = val,
-                                                    "Pos[2]" => pos.2 = val,
-                                                    _ => todo!("{:?}", path)
+                                            let target = match target {
+                                                Target::Selector(Selector { var: SelectorVariable::ThisEntity, .. }) => {
+                                                    ctx.ident.as_ref().unwrap()
                                                 }
+                                                _ => todo!("{:?}", target)
+                                            };
+
+                                            let pos = match target.as_str() {
+                                                "memoryptr" => &mut self.memory_ptr_pos,
+                                                "stackptr" => &mut self.stack_ptr_pos,
+                                                "frameptr" => &mut self.frame_ptr_pos,
+                                                "localptr" => &mut self.local_ptr_pos,
+                                                "globalptr" => &mut self.global_ptr_pos,
+                                                "turtle" => &mut self.turtle_pos,
+                                                "nextchain" => &mut self.next_chain_pos,
+                                                _ => todo!("{:?}", target)
+                                            };
+
+                                            match path.as_str() {
+                                                "Pos[0]" => pos.0 = val,
+                                                "Pos[1]" => pos.1 = val,
+                                                "Pos[2]" => pos.2 = val,
+                                                _ => todo!("{:?}", path)
                                             }
                                         }
                                     }
                                 }
+                                _ => unreachable!(),
                             }
                         }
                     }
@@ -861,29 +940,27 @@ impl Interpreter {
                     // TODO: Determine if the return value passes through
                     // TODO: What happens if the condition is false?
                     Ok(None)
-                } else if let Some((is_success, store_kind)) = store {
-
+                } else if let Some(store) = store {
                     assert!(!cnd.is_empty());
-
-                    assert!(is_success);
 
                     let mut val = true;
 
-                    for (is_unless, cond) in cnd.iter() {
-                        val &= self.check_cond(*is_unless, cond);
+                    for cond in cnd.iter() {
+                        val &= self.check_cond(cond);
                     }
 
-                    match store_kind {
-                        ExecuteStoreKind::Score { target, objective } => {
-                            match target {
-                                Target::Uuid(holder) => {
-                                    println!("Storing into {}", holder);
-                                    self.scoreboard.set(holder, objective, val as i32);
-                                }
-                                _ => todo!("{:?}", target),
+                    match store {
+                        ExecuteSubCommand::StoreScore(StoreScore { is_success, target, target_obj }) => {
+                            if !is_success {
+                                todo!()
                             }
+
+                            let target = get_target_name(target).unwrap();
+
+                            println!("Storing into {}", target);
+                            self.scoreboard.set(target, target_obj, val as i32);
                         }
-                        _ => todo!("{:?}", store_kind)
+                        _ => todo!("{:?}", store)
                     }
 
                     // TODO: ???
@@ -892,167 +969,56 @@ impl Interpreter {
                     todo!()
                 }
             }
+            Command::Comment(c) => {
+                let c = c.to_string();
 
-            /*
-            cmd if cmd.to_string().starts_with("execute at @e[tag=ptr] run") => {
-                let run = if let Command::Execute(Execute { run: Some(d), .. }) = cmd {
-                    &**d
-                } else {
-                    unreachable!()
-                };
+                if let Some(c) = c.strip_prefix("# !INTERPRETER: SYNC ") {
+                    let (f, i) = c.split_once(' ').unwrap();
+                    let f = f.parse::<usize>().unwrap();
+                    let i = i.parse::<usize>().unwrap();
 
-                if let Command::Data(Data { target: DataTarget::Block(block), kind: DataKind::Modify { path, kind: DataModifyKind::Set, source: DataModifySource::Value(v) } }) = run {
-                    let index = match block.as_str() {
-                        "~ ~ ~" => {
-                            get_index(self.ptr_pos.0, self.ptr_pos.1, self.ptr_pos.2)
-                        }
-                        "~-2 1 ~" => {
-                            get_index(self.ptr_pos.0 - 2, 1, self.ptr_pos.2)
-                        }
-                        _ => todo!("{:?}", block)
-                    };
-
-                    if path != "RecordItem.tag.Memory" {
-                        todo!("{:?}", path);
-                    }
-
-                    self.set_word(*v, index.unwrap() as usize)?;
-                } else {
-                    todo!("{:?}", cmd)
-                }
-            }
-            cmd if cmd.to_string().starts_with("execute at @e[tag=ptr]") => {
-                let (subcmds, run) = if let Command::Execute(Execute { run: Some(run), subcommands }) = cmd {
-                    (subcommands, run)
-                } else {
-                    todo!("{:?}", cmd)
-                };
-
-                if subcmds.len() == 1 {
-                    todo!("{}", cmd)
-                }
-
-                if let ExecuteSubCmd::Store { is_success: false, kind: ExecuteStoreKind::Score { target: Target::Uuid(target), objective } } = &subcmds[1] {
-                    if run.to_string() == "data get block ~ ~ ~ RecordItem.tag.Memory 1" {
-                        let index = get_index(self.ptr_pos.0, self.ptr_pos.1, self.ptr_pos.2)?;
-                        let word = self.get_word(index as usize)?;
-                        self.scoreboard.set(target, objective, word);
+                    Err(InterpError::SyncHit(f, i))
+                } else if c == "# !INTERPRETER: TODO" {
+                    Err(InterpError::EnteredTodo)
+                } else if c == "# !INTERPRETER: UNREACHABLE" {
+                    Err(InterpError::EnteredUnreachable)
+                } else if let Some(cond) = c.strip_prefix("# !INTERPRETER: ASSERT ") {
+                    /*let (c, is_unless) = if let Some(c) = cond.strip_prefix("unless ") {
+                        (c, true)
+                    } else if let Some(c) = c.strip_prefix("if ") {
+                        (c, false)
                     } else {
                         todo!()
-                    }
-                } else if subcmds[1].to_string() == "store result block ~ ~ ~ RecordItem.tag.Memory int 1" {
-                    if let Command::ScoreGet(ScoreGet { target: Target::Uuid(target), target_obj }) = &**run {
-                        let val = self.get_score(target, target_obj).unwrap();
-                        let index = get_index(self.ptr_pos.0, self.ptr_pos.1, self.ptr_pos.2)?;
-                        self.set_word(val, index as usize)?;
-                    }
-                } else {
-                    todo!("{:?} {}", subcmds[1].to_string(), cmd)
-                }
-            }
-            */
-            /*
-            Command::Execute(Execute { run: Some(run), subcommands }) => {
-                if subcommands.iter().all(|s| matches!(s, ExecuteSubCmd::Condition { .. })) {
-                    if subcommands.iter().all(|s| if let ExecuteSubCmd::Condition { is_unless, cond } = s {
-                        self.check_cond(*is_unless, cond)
-                    } else {
-                        unreachable!()
-                    }) {
-                        self.execute_cmd_ctx(run, ctx)?;
-                    }
-                } else if cmd.to_string().starts_with("execute at @e[tag=turtle] run setblock ~ ~ ~") {
-                    if let Command::SetBlock(SetBlock { pos: _, block, kind: _ }) = &**run {
-                        eprintln!(
-                            "Placed block at {} {} {}: {:?}",
-                            self.turtle_pos.0,
-                            self.turtle_pos.1,
-                            self.turtle_pos.2,
-                            block
-                        );
-                    } else {
-                        unreachable!()
-                    }
-                } else if cmd.to_string().starts_with("execute if score %%cmdcount rust < %%CMD_LIMIT rust at @e[tag=next] run data modify block ~ ~ ~ Command set value ") {
-                    if let Command::Data(Data { kind: DataKind::Modify { source: DataModifySource::ValueString(func), .. }, .. }) = &**run {
-                        todo!("{:?}", func);
-                    } else {
-                        unreachable!()
-                    }
-                } else {
-                    todo!("{}", cmd)
-                }
-            }
-            Command::Execute(Execute { run: None, subcommands }) => {
-                let store_target = if let ExecuteSubCmd::Store { is_success: true, kind: ExecuteStoreKind::Score { target: Target::Uuid(target), objective } } = &subcommands[0] {
-                    (target, objective)
-                } else {
-                    todo!("{:?}", subcommands[0])
-                };
+                    };
 
-                if subcommands[1..].iter().all(|sc| matches!(sc, ExecuteSubCmd::Condition { .. })) {
-                    let mut result = true;
-                    for subcmd in subcommands[1..].iter() {
-                        if let ExecuteSubCmd::Condition { is_unless, cond } = subcmd {
-                            result = result && self.check_cond(*is_unless, cond);
-                        } else {
-                            unreachable!()
+                    let cond = ExecuteSubCommand::from_str(c).unwrap();
+
+                    if !self.check_cond(&cond) {
+                        eprintln!("Currently at:");
+                        for (f, c) in self.call_stack.iter() {
+                            eprintln!("{}, {}", self.program[*f].id, c);
                         }
+                        return Err(InterpError::AssertionFailed);
                     }
 
-                    self.scoreboard.set(store_target.0, store_target.1, result as i32);
-                } else {
+                    Ok(None)*/
                     todo!()
+                } else if c.contains("!INTERPRETER") {
+                    todo!("{}", c)
+                } else {
+                    Ok(None)
                 }
             }
-            */
-            Command::Comment(c) if c.starts_with("!INTERPRETER: SYNC ") => {
-                let c = c.strip_prefix("!INTERPRETER: SYNC ").unwrap();
-                let (f, i) = c.split_once(' ').unwrap();
-                let f = f.parse::<usize>().unwrap();
-                let i = i.parse::<usize>().unwrap();
-
-                Err(InterpError::SyncHit(f, i))
-            }
-            Command::Comment(c) if c == "!INTERPRETER: TODO" => {
-                Err(InterpError::EnteredTodo)
-            }
-            Command::Comment(c) if c == "!INTERPRETER: UNREACHABLE" => {
-                Err(InterpError::EnteredUnreachable)
-            }
-            Command::Comment(c) if c.starts_with("!INTERPRETER: ASSERT ") => {
-                let c = &c["!INTERPRETER: ASSERT ".len()..];
-
-                let (c, is_unless) = if let Some(c) = c.strip_prefix("unless ") {
-                    (c, true)
-                } else if let Some(c) = c.strip_prefix("if ") {
-                    (c, false)
-                } else {
-                    todo!()
-                };
-
-                let cond = ExecuteCondition::from_str(c).unwrap();
-
-                if !self.check_cond(is_unless, &cond) {
-                    eprintln!("Currently at:");
-                    for (f, c) in self.call_stack.iter() {
-                        eprintln!("{}, {}", self.program[*f].id, c);
-                    }
-                    return Err(InterpError::AssertionFailed);
-                }
-
-                Ok(None)
-            }
-            Command::Comment(_) => { Ok(None) }
             Command::Kill(_) => {
                 // TODO:
                 Ok(None)
             }
             Command::Summon(Summon { entity, pos, data }) => {
-                let pos = pos.maybe_based(ctx.pos);
+                let pos = maybe_based(pos, ctx.pos);
 
                 if entity == "minecraft:armor_stand" {
-                    if let Some(data) = data {
+                    if let Some(data) = &data.0 {
+                        let data = data.to_string();
 
                         if data.contains("frameptr") {
                             self.frame_ptr_pos = pos;
@@ -1085,8 +1051,8 @@ impl Interpreter {
                     todo!()
                 }
             }
-            Command::ObjAdd(ObjAdd { obj, criteria }) => {
-                if criteria == &ObjectiveCriterion::Dummy {
+            Command::ObjAdd(ObjAdd(obj, crit)) => {
+                if crit == &ObjectiveCriterion::Dummy {
                     self.scoreboard.0.insert(obj.clone(), HashMap::new());
                     Ok(None)
                 } else {
@@ -1105,7 +1071,7 @@ impl Interpreter {
                     _ => todo!("{:?}", target)
                 };
 
-                let pos = pos.maybe_based(ctx.pos);
+                let pos = maybe_based(pos, ctx.pos);
 
                 match target.as_str() {
                     "stackptr" => self.stack_ptr_pos = pos,
