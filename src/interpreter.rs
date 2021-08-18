@@ -1,4 +1,5 @@
 use datapack_common::functions::command::*;
+use datapack_common::functions::command::commands::Execute;
 use datapack_common::functions::raw_text::TextComponent;
 use datapack_common::functions::*;
 use datapack_common::functions::command_components::*;
@@ -229,6 +230,35 @@ struct Context {
     pub ident: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecResult {
+    /// Basically a TODO:
+    Unknown,
+    /// The command did not finish, so it has no return value
+    Interrupted,
+    Failed,
+    Succeeded(i32),
+}
+
+impl ExecResult {
+    fn get_return(self) -> Option<(bool, i32)> {
+        match self {
+            ExecResult::Unknown => panic!(),
+            ExecResult::Interrupted => None,
+            ExecResult::Failed => Some((false, 0)),
+            ExecResult::Succeeded(v) => Some((true, v)),
+        }
+    }
+
+    fn get_success(self) -> Option<bool> {
+        self.get_return().map(|(s, _)| s)
+    }
+
+    fn get_result(self) -> Option<i32> {
+        self.get_return().map(|(_, r)| r)
+    }
+}
+
 pub struct Interpreter {
     pub program: Vec<Function>,
 
@@ -297,6 +327,20 @@ impl Interpreter {
         }
     }
 
+    pub fn new_single_file(program: Vec<Command>) -> Self {
+        let id = FunctionIdent {
+            namespace: "datapackvm".to_string(),
+            path: "main".to_string(),
+        };
+        
+        let program = vec![Function {
+            id,
+            cmds: program,
+        }];
+
+        Self::new(program, 0)
+    }
+
     pub fn program(&self) -> &[Function] {
         &self.program
     }
@@ -352,21 +396,6 @@ impl Interpreter {
 
     pub fn get_score(&self, holder: &ScoreHolder, obj: &Objective) -> Result<i32, String> {
         self.scoreboard.get(holder, obj).ok_or_else(|| format!("read from uninitialized variable {} {}", holder, obj))
-    }
-
-    fn check_cond(&self, subcmd: &ExecuteSubCommand) -> bool {
-        match subcmd {
-            ExecuteSubCommand::IfScoreMatches(cond) => {
-                self.check_if_score_matches(cond)
-            }
-            ExecuteSubCommand::IfScoreRelation(cond) => {
-                self.check_if_score_relation(cond)
-            }
-            ExecuteSubCommand::IfBlock(cond) => {
-                self.check_if_block(cond)
-            }
-            _ => todo!(),
-        }
     }
 
     fn check_if_score_matches(&self, cond: &IfScoreMatches) -> bool {
@@ -582,13 +611,186 @@ impl Interpreter {
 
     }
 
-    pub fn execute_cmd(&mut self, cmd: &Command) -> Result<Option<i32>, InterpError> {
+    fn run_execute(
+        &mut self,
+        Execute { subcommands, run }: &Execute,
+        ctx: &mut Context
+    ) -> Result<ExecResult, InterpError> {
+        let mut ctx = ctx.clone();
+
+        let run = &run.0;
+        let subcommands = &subcommands.0[..];
+
+        let prev_subcommands = if run.is_some() {
+            subcommands
+        } else {
+            &subcommands[..subcommands.len() - 1]
+        };
+
+        let mut store = None;
+
+        for subcmd in prev_subcommands.iter() {
+            match subcmd {
+                ExecuteSubCommand::IfScoreMatches(cond) => {
+                    if !self.check_if_score_matches(cond) {
+                        return Ok(ExecResult::Interrupted);
+                    }
+                }
+                ExecuteSubCommand::IfScoreRelation(cond) => {
+                    if !self.check_if_score_relation(cond) {
+                        return Ok(ExecResult::Interrupted);
+                    }
+                }
+                ExecuteSubCommand::IfBlock(cond) => {
+                    if !self.check_if_block(cond) {
+                        return Ok(ExecResult::Interrupted);
+                    }
+                }
+                ExecuteSubCommand::At(At { target }) => {
+                    ctx.pos = Some(self.get_pos(target));
+                }
+                ExecuteSubCommand::As(As { target }) => {
+                    ctx.ident = Some(self.get_ident(target));
+                }
+                ExecuteSubCommand::StoreScore(..) |
+                ExecuteSubCommand::StoreStorage(..) => {
+                    assert!(store.is_none());
+                    store = Some(subcmd);
+                }
+                _ => todo!("{:?}", subcmd),
+            }
+        }
+
+        let end_result = if let Some(run) = run.as_deref() {
+            self.execute_cmd_ctx(run, &mut ctx)?
+        } else {
+            let subcmd = subcommands.last().unwrap();
+
+            match subcmd {
+                ExecuteSubCommand::IfScoreMatches(cond) => {
+                    let result = self.check_if_score_matches(cond);
+
+                    if result {
+                        ExecResult::Succeeded(1)
+                    } else {
+                        ExecResult::Failed
+                    }
+                }
+                ExecuteSubCommand::IfScoreRelation(cond) => {
+                    let result = self.check_if_score_relation(cond);
+
+                    if result {
+                        ExecResult::Succeeded(1)
+                    } else {
+                        ExecResult::Failed
+                    }
+                }
+                ExecuteSubCommand::IfBlock(cond) => {
+                    let result = self.check_if_block(cond);
+
+                    if result {
+                        ExecResult::Succeeded(1)
+                    } else {
+                        ExecResult::Failed
+                    }
+                }
+                _ => todo!("{:?}", subcmd)
+            }
+        };
+
+        if let Some(store) = store {
+            match store {
+                ExecuteSubCommand::StoreScore(StoreScore { is_success, target, target_obj, }) => {
+                    let value = if *is_success {
+                        end_result.get_success().map(|s| s as i32)
+                    } else {
+                        end_result.get_result()
+                    };
+
+                    if let Some(value) = value {
+                        let target = get_target_name(target).unwrap();
+
+                        self.scoreboard.set(target, target_obj, value);
+
+                        // TODO:
+                        Ok(ExecResult::Unknown)
+                    } else {
+                        Ok(ExecResult::Interrupted)
+                    }
+                }
+                ExecuteSubCommand::StoreStorage(StoreStorage { is_success, target, path, ty, scale }) => {
+                    let value = if *is_success {
+                        end_result.get_success().map(|s| s as i32)
+                    } else {
+                        end_result.get_result()
+                    };
+
+                    let value = if let Some(value) = value {
+                        value
+                    } else {
+                        return Ok(ExecResult::Interrupted);
+                    };
+
+                    // The number in the file is *always* 1.0
+                    #[allow(clippy::float_cmp)]
+                    { assert_eq!(*scale, 1.0); }
+
+                    match target {
+                        DataTarget::Block(pos) => {
+                            assert!(ty == "int");
+
+                            let pos = maybe_based(pos, ctx.pos);
+
+                            self.set_block_data_int(pos, path, value)?;
+
+                            Ok(ExecResult::Unknown)
+                        }
+                        DataTarget::Entity(target) => {
+                            assert!(ty == "double");
+
+                            let target = match target {
+                                Target::Selector(Selector { var: SelectorVariable::ThisEntity, .. }) => {
+                                    ctx.ident.as_ref().unwrap()
+                                }
+                                _ => todo!("{:?}", target)
+                            };
+
+                            let pos = match target.as_str() {
+                                "memoryptr" => &mut self.memory_ptr_pos,
+                                "stackptr" => &mut self.stack_ptr_pos,
+                                "frameptr" => &mut self.frame_ptr_pos,
+                                "localptr" => &mut self.local_ptr_pos,
+                                "globalptr" => &mut self.global_ptr_pos,
+                                "turtle" => &mut self.turtle_pos,
+                                "nextchain" => &mut self.next_chain_pos,
+                                _ => todo!("{:?}", target)
+                            };
+
+                            match path.as_str() {
+                                "Pos[0]" => pos.0 = value,
+                                "Pos[1]" => pos.1 = value,
+                                "Pos[2]" => pos.2 = value,
+                                _ => todo!("{:?}", path)
+                            }
+
+                            Ok(ExecResult::Unknown)
+                        }
+                    }
+                }
+                _ => unreachable!(),
+            }
+        } else {
+            Ok(end_result)
+        }
+    }
+
+    pub fn execute_cmd(&mut self, cmd: &Command) -> Result<ExecResult, InterpError> {
         let mut ctx = Context::default();
 
         self.execute_cmd_ctx(cmd, &mut ctx)
     }
 
-    fn execute_cmd_ctx(&mut self, cmd: &Command, ctx: &mut Context) -> Result<Option<i32>, InterpError> {
+    fn execute_cmd_ctx(&mut self, cmd: &Command, ctx: &mut Context) -> Result<ExecResult, InterpError> {
         use datapack_common::functions::command::commands::*;
 
         //println!("{}", cmd);
@@ -607,7 +809,7 @@ impl Interpreter {
                     "maxCommandChainLength" => {
                         assert!(value.0.is_none());
 
-                        Ok(Some(600_000))
+                        Ok(ExecResult::Succeeded(600_000))
                     }
                     _ => todo!("{} {:?}", rule, value)
                 }
@@ -625,7 +827,7 @@ impl Interpreter {
 
                 self.scoreboard.set(target, target_obj, lhs);
 
-                Ok(None)
+                Ok(ExecResult::Unknown)
             }
             Command::ScoreOp(ScoreOp { target, target_obj, op, source, source_obj }) => {
                 let target = get_name(target).unwrap();
@@ -705,7 +907,7 @@ impl Interpreter {
                     }
                 }
 
-                Ok(None)
+                Ok(ExecResult::Unknown)
             }
             Command::FuncCall(FuncCall { id }) => {
                 //if id"stdout:putc" {
@@ -728,7 +930,7 @@ impl Interpreter {
                 self.call_stack.push((called_idx, 0));
                 //}
 
-                Ok(None)
+                Ok(ExecResult::Unknown)
             }
             Command::Clone(Clone { start, end, dest }) => {
                 let start = maybe_based(start, ctx.pos);
@@ -758,7 +960,7 @@ impl Interpreter {
                     }
                 }
 
-                Ok(None)
+                Ok(ExecResult::Unknown)
             }
             Command::Fill(Fill { start, end, block, place_kind }) => {
                 let start = maybe_based(start, ctx.pos);
@@ -783,7 +985,7 @@ impl Interpreter {
                     }
                 } 
 
-                Ok(None)
+                Ok(ExecResult::Unknown)
             }
             Command::DataGet(DataGet { target, path, scale }) => {
                 match target {
@@ -794,7 +996,9 @@ impl Interpreter {
                         #[allow(clippy::float_cmp)]
                         { assert!(scale.0 == None || scale.0 == Some(1.0)); }
 
-                        Ok(Some(self.get_block_data(pos, path)?))
+                        let result = self.get_block_data(pos, path)?;
+
+                        Ok(ExecResult::Succeeded(result))
                     }
                     _ => todo!("{:?}", target)
                 }
@@ -808,7 +1012,7 @@ impl Interpreter {
 
                         if let DataModifyKind::Set(Set { value }) = kind {
                             self.set_block_data(pos, path, value)?;
-                            Ok(None)
+                            Ok(ExecResult::Unknown)
                         } else {
                             todo!("{:?}", kind)
                         }
@@ -821,159 +1025,31 @@ impl Interpreter {
 
                 self.scoreboard.set(target, target_obj, *score);
 
-                Ok(None)
+                Ok(ExecResult::Unknown)
             }
             Command::ScoreGet(ScoreGet { target, target_obj }) => {
                 let target = get_name(target).unwrap();
 
-                Ok(Some(self.scoreboard.get(target, target_obj).unwrap_or_else(|| panic!("{:?} {:?}", target, target_obj))))
+                let result = self.scoreboard.get(target, target_obj).unwrap_or_else(|| panic!("{:?} {:?}", target, target_obj));
+
+                Ok(ExecResult::Succeeded(result))
             }
             Command::Tellraw(Tellraw { message, target: _target }) => {
                 let msg = self.eval_message(&message.components);
                 println!("\n{}\n", msg);
                 self.output.push(msg);
 
-                Ok(None)
+                Ok(ExecResult::Unknown)
             }
             Command::SetBlock(SetBlock { pos, block, kind }) => {
                 let pos = maybe_based(pos, ctx.pos);
 
                 self.set_block(pos, block, *kind);
 
-                Ok(None)
+                Ok(ExecResult::Unknown)
             }
-            Command::Execute(Execute { subcommands, run }) => {
-                let mut ctx = ctx.clone();
-
-                let mut store = None;
-
-                let mut cnd = Vec::new();
-
-                for subcmd in subcommands.0.iter() {
-                    match subcmd {
-                        // TODO: DETERMINE HOW THIS INTERACTS WITH OTHER SELECTORS
-                        ExecuteSubCommand::IfScoreMatches { .. } |
-                        ExecuteSubCommand::IfScoreRelation { .. } |
-                        ExecuteSubCommand::IfBlock { .. } => {
-                            cnd.push(subcmd);
-                        }
-                        ExecuteSubCommand::At(At { target }) => {
-                            ctx.pos = Some(self.get_pos(target));
-                        }
-                        ExecuteSubCommand::As(As { target }) => {
-                            ctx.ident = Some(self.get_ident(target));
-                        }
-                        ExecuteSubCommand::StoreScore(..) |
-                        ExecuteSubCommand::StoreStorage(..) => {
-                            assert!(store.is_none());
-                            store = Some(subcmd);
-                        }
-                        _ => todo!("{} ({:?})", cmd, subcmd),
-                    }
-                }
-
-                if let Some(run) = run.0.as_deref() {
-                    let do_run = cnd.into_iter().all(|cond| self.check_cond(cond));
-
-                    if do_run {
-                        let val = self.execute_cmd_ctx(run, &mut ctx)?;
-
-                        if let Some(store) = store {
-                            let val = val.unwrap();
-
-                            match store {
-                                ExecuteSubCommand::StoreScore(StoreScore { is_success, target, target_obj, }) => {
-                                    if *is_success {
-                                        todo!()
-                                    }
-
-                                    let target = get_target_name(target).unwrap();
-
-                                    self.scoreboard.set(target, target_obj, val);
-                                }
-                                ExecuteSubCommand::StoreStorage(StoreStorage { is_success, target, path, ty, scale }) => {
-                                    if *is_success {
-                                        todo!()
-                                    }
-
-                                    // The number in the file is *always* 1.0
-                                    #[allow(clippy::float_cmp)]
-                                    { assert_eq!(*scale, 1.0); }
-
-                                    match target {
-                                        DataTarget::Block(pos) => {
-                                            assert!(ty == "int");
-
-                                            let pos = maybe_based(pos, ctx.pos);
-
-                                            self.set_block_data_int(pos, path, val)?;
-                                        }
-                                        DataTarget::Entity(target) => {
-                                            assert!(ty == "double");
-
-                                            let target = match target {
-                                                Target::Selector(Selector { var: SelectorVariable::ThisEntity, .. }) => {
-                                                    ctx.ident.as_ref().unwrap()
-                                                }
-                                                _ => todo!("{:?}", target)
-                                            };
-
-                                            let pos = match target.as_str() {
-                                                "memoryptr" => &mut self.memory_ptr_pos,
-                                                "stackptr" => &mut self.stack_ptr_pos,
-                                                "frameptr" => &mut self.frame_ptr_pos,
-                                                "localptr" => &mut self.local_ptr_pos,
-                                                "globalptr" => &mut self.global_ptr_pos,
-                                                "turtle" => &mut self.turtle_pos,
-                                                "nextchain" => &mut self.next_chain_pos,
-                                                _ => todo!("{:?}", target)
-                                            };
-
-                                            match path.as_str() {
-                                                "Pos[0]" => pos.0 = val,
-                                                "Pos[1]" => pos.1 = val,
-                                                "Pos[2]" => pos.2 = val,
-                                                _ => todo!("{:?}", path)
-                                            }
-                                        }
-                                    }
-                                }
-                                _ => unreachable!(),
-                            }
-                        }
-                    }
-
-                    // TODO: Determine if the return value passes through
-                    // TODO: What happens if the condition is false?
-                    Ok(None)
-                } else if let Some(store) = store {
-                    assert!(!cnd.is_empty());
-
-                    let mut val = true;
-
-                    for cond in cnd.iter() {
-                        val &= self.check_cond(cond);
-                    }
-
-                    match store {
-                        ExecuteSubCommand::StoreScore(StoreScore { is_success, target, target_obj }) => {
-                            if !is_success {
-                                todo!()
-                            }
-
-                            let target = get_target_name(target).unwrap();
-
-                            println!("Storing into {}", target);
-                            self.scoreboard.set(target, target_obj, val as i32);
-                        }
-                        _ => todo!("{:?}", store)
-                    }
-
-                    // TODO: ???
-                    Ok(None)
-                } else {
-                    todo!()
-                }
+            Command::Execute(cmd) => {
+                self.run_execute(cmd, ctx)
             }
             Command::Comment(c) => {
                 let c = c.to_string();
@@ -1012,12 +1088,12 @@ impl Interpreter {
                 } else if c.contains("!INTERPRETER") {
                     todo!("{}", c)
                 } else {
-                    Ok(None)
+                    Ok(ExecResult::Unknown)
                 }
             }
             Command::Kill(_) => {
                 // TODO:
-                Ok(None)
+                Ok(ExecResult::Unknown)
             }
             Command::Summon(Summon { entity, pos, data }) => {
                 let pos = maybe_based(pos, ctx.pos);
@@ -1028,25 +1104,25 @@ impl Interpreter {
 
                         if data.contains("frameptr") {
                             self.frame_ptr_pos = pos;
-                            Ok(None)
+                            Ok(ExecResult::Unknown)
                         } else if data.contains("stackptr") {
                             self.stack_ptr_pos = pos;
-                            Ok(None)
+                            Ok(ExecResult::Unknown)
                         } else if data.contains("globalptr") {
                             self.global_ptr_pos = pos;
-                            Ok(None)
+                            Ok(ExecResult::Unknown)
                         } else if data.contains("localptr") {
                             self.local_ptr_pos = pos;
-                            Ok(None)
+                            Ok(ExecResult::Unknown)
                         } else if data.contains("memoryptr") {
                             self.memory_ptr_pos = pos;
-                            Ok(None)
+                            Ok(ExecResult::Unknown)
                         } else if data.contains("turtle") {
                             self.turtle_pos = pos;
-                            Ok(None)
+                            Ok(ExecResult::Unknown)
                         } else if data.contains("nextchain") {
                             self.next_chain_pos = pos;
-                            Ok(None)
+                            Ok(ExecResult::Unknown)
                         } else {
                             todo!()
                         }
@@ -1060,14 +1136,14 @@ impl Interpreter {
             Command::ObjAdd(ObjAdd(obj, crit)) => {
                 if crit == &ObjectiveCriterion::Dummy {
                     self.scoreboard.0.insert(obj.clone(), HashMap::new());
-                    Ok(None)
+                    Ok(ExecResult::Unknown)
                 } else {
                     todo!()
                 }
             }
             Command::ObjRemove(obj) => {
                 self.scoreboard.0.remove(&obj.0);
-                Ok(None)
+                Ok(ExecResult::Unknown)
             }
             Command::Teleport(Teleport { target, pos }) => {
                 let target = match target {
@@ -1089,7 +1165,7 @@ impl Interpreter {
                     _ => todo!("{:?}", target)
                 };
 
-                Ok(None)
+                Ok(ExecResult::Unknown)
             }
 
             cmd => todo!("{}", cmd)
@@ -1176,4 +1252,56 @@ impl Interpreter {
     pub fn halted(&self) -> bool {
         self.call_stack.is_empty()
     }
+}
+
+#[cfg(test)]
+mod test {
+    use super::Interpreter;
+    use datapack_common::functions::{Command, command_components::{Objective, ScoreHolder}};
+
+    fn run_cond_test(inner: &[&str]) -> i32 {
+        let setup = [
+            "scoreboard objectives add test dummy",
+            "scoreboard players set return test -1",
+            "scoreboard players set true_val test 1",
+            "scoreboard players set false_val test 0",
+            "scoreboard players set foo test 42",
+        ];
+
+        let code = setup
+            .iter()
+            .chain(inner)
+            .map(|s| s.to_owned().parse::<Command>().unwrap())
+            .collect();
+
+        let mut i = Interpreter::new_single_file(code);
+
+        i.run_to_end().unwrap();
+
+        let name = ScoreHolder::new("return".to_string()).unwrap();
+        let obj = Objective::new("test".to_string()).unwrap();
+
+        i.scoreboard.get(&name, &obj).unwrap()
+    }
+
+    fn cond_test(inner: &[&str], expected: i32) {
+        assert_eq!(run_cond_test(inner), expected);
+    }
+
+    #[test]
+    fn single_condition() {
+        cond_test(&["execute store result score return test if score true_val test matches 1"], 1);
+        cond_test(&["execute store result score return test if score false_val test matches 1"], 0);
+
+        cond_test(&["execute store success score return test if score true_val test matches 1"], 1);
+        cond_test(&["execute store success score return test if score false_val test matches 1"], 0);
+    }
+
+    #[test]
+    fn condition_and_command() {
+        cond_test(&["execute store result score return test if score true_val test matches 1 run scoreboard players get foo test"], 42);
+        cond_test(&["execute store result score return test if score false_val test matches 1 run scoreboard players get foo test"], -1);
+    }
+
+    // TODO: More
 }
