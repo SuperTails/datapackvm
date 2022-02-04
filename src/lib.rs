@@ -4,7 +4,7 @@ pub use interpreter::Interpreter;
 
 /*pub fn run_program(funcs: Vec<Function>, start_func: &str) -> Vec<String> {
     let funcs = get_functions(dir).unwrap();
-    
+
     let idx = funcs.iter().enumerate().find(|(_, f)| {
         f.id.path == "main"
     }).unwrap_or_else(|| {
@@ -20,5 +20,4 @@ pub use interpreter::Interpreter;
 }*/
 
 #[cfg(test)]
-mod tests {
-}
+mod tests {}
