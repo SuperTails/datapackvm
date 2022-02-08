@@ -1252,7 +1252,10 @@ impl Interpreter {
                 Ok(ExecResult::Unknown)
             }
             Command::Summon(Summon { entity, pos, data }) => {
-                let pos = maybe_based(pos, ctx.pos);
+                let pos = pos
+                    .0
+                    .as_ref()
+                    .map_or((0, 0, 0), |pos| maybe_based(pos, ctx.pos));
 
                 if entity == "minecraft:armor_stand" {
                     if let Some(data) = &data.0 {
