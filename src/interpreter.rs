@@ -888,6 +888,7 @@ impl Interpreter {
 
                             Ok(ExecResult::Unknown)
                         }
+                        DataTarget::Storage(_) => todo!("Implement data storage"),
                     }
                 }
                 _ => unreachable!(),
