@@ -10,5 +10,5 @@ serde = "1.0"
 serde_with = "1.9"
 serde_json = "1.0"
 lazy_static = "1.4"
-#datapack_common = { git = "https://github.com/SuperTails/datapack_common" }
-datapack_common = { path = "../datapack_common" }
+datapack_common = { git = "https://github.com/SuperTails/datapack_common" }
+#datapack_common = { path = "../datapack_common" }
