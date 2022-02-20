@@ -335,6 +335,33 @@ impl NbtStorage {
 
         get_nbt_from_compound(tag, &path.0)
     }
+
+    pub fn contains_path(&self, storage_id: &StorageId, path: &NbtPath) -> bool {
+        let mut tag = if let Some(tag) = self.0.get(storage_id) {
+            tag
+        } else {
+            return false;
+        };
+
+        for part in path.0[..path.0.len() - 1].iter() {
+            if !part.indices.is_empty() {
+                todo!()
+            }
+
+            if let Some(SNbt::Compound(t)) = tag.0.get(<_ as Borrow<str>>::borrow(&part.name)) {
+                tag = t;
+            } else {
+                return false;
+            }
+        }
+
+        let last_part = path.0.last().unwrap();
+        if !last_part.indices.is_empty() {
+            todo!()
+        }
+
+        tag.0.contains_key(<_ as Borrow<str>>::borrow(&last_part.name))
+    }
 }
 
 pub fn get_nbt_from_compound<'a>(tag: &'a SNbtCompound, path: &[NbtPathPart]) -> &'a SNbt {
@@ -425,6 +452,8 @@ pub fn get_nbt_from_tag_mut<'a>(mut tag: &'a mut SNbt, path: &[NbtPathPart]) -> 
 pub struct Interpreter {
     pub program: Vec<Function>,
 
+    pub traces: HashMap<FunctionIdent, usize>,
+
     pub scoreboard: Scoreboard,
 
     pub nbt_storage: NbtStorage,
@@ -475,6 +504,7 @@ impl Interpreter {
             ctx_pos: None,
             call_stack: vec![(start_func_idx, 0)],
             blocks: HashMap::new(),
+            traces: Default::default(),
             memory_ptr_pos: Default::default(),
             frame_ptr_pos: Default::default(),
             local_ptr_pos: Default::default(),
@@ -594,6 +624,21 @@ impl Interpreter {
 
     fn check_if_block(&self, _cond: &IfBlock) -> bool {
         todo!()
+    }
+
+    fn check_if_data(&self, cond: &IfData) -> bool {
+        match &cond.target {
+            DataTarget::Storage(storage_id) => {
+                let result = self.nbt_storage.contains_path(storage_id, &cond.path);
+
+                if cond.is_unless {
+                    !result
+                } else {
+                    result
+                }
+            }
+            _ => todo!("{:?}", cond.target)
+        }
     }
 
     fn set_block(&mut self, pos: (i32, i32, i32), block: &BlockSpec, mode: SetBlockKind) {
@@ -872,6 +917,11 @@ impl Interpreter {
                 }
                 ExecuteSubCommand::IfBlock(cond) => {
                     if !self.check_if_block(cond) {
+                        return Ok(ExecResult::Interrupted);
+                    }
+                }
+                ExecuteSubCommand::IfData(cond) => {
+                    if !self.check_if_data(cond) {
                         return Ok(ExecResult::Interrupted);
                     }
                 }
@@ -1518,6 +1568,12 @@ impl Interpreter {
         let top_func = self.program[*top_func_idx].id.to_string();
 
         let (func_idx, cmd_idx) = self.call_stack.last_mut().unwrap();
+
+        if let Some(cnt) = self.traces.get_mut(&self.program[*func_idx].id) {
+            *cnt += 1;
+        } else {
+            self.traces.insert(self.program[*func_idx].id.clone(), 1);
+        }
 
         //println!("Function {} at command {}", self.program[*func_idx].id, cmd_idx);
 
