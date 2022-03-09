@@ -6,6 +6,9 @@ use datapack_common::functions::command_components::*;
 use datapack_common::functions::raw_text::TextComponent;
 use datapack_common::functions::*;
 use std::borrow::Borrow;
+use std::cmp;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::str::FromStr;
@@ -448,15 +451,78 @@ pub fn get_nbt_from_tag_mut<'a>(mut tag: &'a mut SNbt, path: &[NbtPathPart]) -> 
     tag
 }
 
+#[derive(Debug)]
+struct ScheduledFunc(pub u32, pub FunctionIdent);
+
+impl PartialEq for ScheduledFunc {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for ScheduledFunc {}
+
+impl PartialOrd for ScheduledFunc {
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
+        self.0.partial_cmp(&other.0)
+    }
+}
+
+impl Ord for ScheduledFunc {
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        self.partial_cmp(other).unwrap()
+    }
+}
+
+#[derive(Default, Debug)]
+pub struct Schedule(BinaryHeap<Reverse<ScheduledFunc>>);
+
+impl Schedule {
+    pub fn schedule_replace(&mut self, time: u32, func: FunctionIdent) {
+        if self.0.iter().any(|Reverse(f)| f.1 == func) {
+            todo!()
+        }
+
+        self.schedule_append(time, func);
+    }
+
+    pub fn schedule_append(&mut self, time: u32, func: FunctionIdent) {
+        self.0.push(Reverse(ScheduledFunc(time, func)));
+    }
+
+    pub fn next_tick(&self) -> Option<u32> {
+        self.0.peek().map(|f| f.0.0)
+    }
+
+    pub fn get_next(&mut self, time: u32) -> Option<(u32, FunctionIdent)> {
+        if let Some(Reverse(next)) = self.0.peek() {
+            assert!(next.0 >= time);
+            if next.0 == time {
+                let next = self.0.pop().unwrap().0;
+                Some((next.0, next.1))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
 
 pub struct Interpreter {
     pub program: Vec<Function>,
 
-    pub traces: HashMap<FunctionIdent, usize>,
+    pub indiv_time: HashMap<FunctionIdent, usize>,
 
     pub scoreboard: Scoreboard,
 
     pub nbt_storage: NbtStorage,
+
+    schedule: Schedule,
 
     call_stack: Vec<(usize, usize)>,
     ctx_pos: Option<(i32, i32, i32)>,
@@ -475,7 +541,7 @@ pub struct Interpreter {
     next_pos: Option<(usize, usize, (i32, i32, i32))>,
 
     pub output: Vec<String>,
-    pub tick: usize,
+    pub tick: u32,
 
     pub last_commands_run: usize,
     commands_run: usize,
@@ -503,8 +569,9 @@ impl Interpreter {
             program,
             ctx_pos: None,
             call_stack: vec![(start_func_idx, 0)],
+            schedule: Schedule::default(),
             blocks: HashMap::new(),
-            traces: Default::default(),
+            indiv_time: Default::default(),
             memory_ptr_pos: Default::default(),
             frame_ptr_pos: Default::default(),
             local_ptr_pos: Default::default(),
@@ -623,7 +690,8 @@ impl Interpreter {
     }
 
     fn check_if_block(&self, _cond: &IfBlock) -> bool {
-        todo!()
+        // TODO:
+        false
     }
 
     fn check_if_data(&self, cond: &IfData) -> bool {
@@ -647,7 +715,7 @@ impl Interpreter {
         if block.id.as_ref() == "minecraft:air" {
             self.blocks.remove(&pos);
         } else {
-            println!("{:?}", pos);
+            //println!("{:?}", pos);
 
             let block = Block::try_from(block).unwrap();
 
@@ -1097,6 +1165,10 @@ impl Interpreter {
     ) -> Result<ExecResult, InterpError> {
         use datapack_common::functions::command::commands::*;
 
+        /*for (f, i) in self.call_stack.iter() {
+            print!("({}, {}), ", self.program[*f].id, i);
+        }*/
+
         //println!("{}", cmd);
         /*if !self
             .call_stack
@@ -1113,7 +1185,7 @@ impl Interpreter {
                     "maxCommandChainLength" => {
                         assert!(value.0.is_none());
 
-                        Ok(ExecResult::Succeeded(600_000))
+                        Ok(ExecResult::Succeeded(1_000_000))
                     }
                     _ => todo!("{} {:?}", rule, value),
                 }
@@ -1549,6 +1621,17 @@ impl Interpreter {
                 Ok(ExecResult::Unknown)
             }
 
+            Command::Schedule(schedule) => {
+                let time = self.tick + schedule.delay as u32;
+                if schedule.replace {
+                    self.schedule.schedule_replace(time, schedule.id.clone());
+                } else {
+                    self.schedule.schedule_append(time, schedule.id.clone());
+                }
+
+                Ok(ExecResult::Unknown)
+            }
+
             cmd => todo!("{}", cmd),
         }
     }
@@ -1558,22 +1641,28 @@ impl Interpreter {
         self.program[*top_func_idx].id.to_string()
     }
 
+    fn update_time_traces(&mut self) {
+        let (current_func, _) = self.call_stack.last_mut().unwrap();
+
+        if let Some(cnt) = self.indiv_time.get_mut(&self.program[*current_func].id) {
+            *cnt += 1;
+        } else {
+            self.indiv_time.insert(self.program[*current_func].id.clone(), 1);
+        }
+    }
+
     /// Executes the next command
     pub fn step(&mut self) -> Result<(), InterpError> {
-        if self.commands_run >= 600_000 {
+        if self.commands_run >= 30_000_000 {
             return Err(InterpError::MaxCommandsRun);
         }
 
         let (top_func_idx, _) = self.call_stack.first().unwrap();
         let top_func = self.program[*top_func_idx].id.to_string();
 
-        let (func_idx, cmd_idx) = self.call_stack.last_mut().unwrap();
+        self.update_time_traces();
 
-        if let Some(cnt) = self.traces.get_mut(&self.program[*func_idx].id) {
-            *cnt += 1;
-        } else {
-            self.traces.insert(self.program[*func_idx].id.clone(), 1);
-        }
+        let (func_idx, cmd_idx) = self.call_stack.last_mut().unwrap();
 
         //println!("Function {} at command {}", self.program[*func_idx].id, cmd_idx);
 
@@ -1595,39 +1684,58 @@ impl Interpreter {
         Ok(())
     }
 
+    pub fn next_tick(&mut self) {
+        self.tick += 1;
+
+        if let Some(ctx_pos) = self.ctx_pos {
+            println!("Pos was {:?}", ctx_pos);
+            if self.trigger_chain(ctx_pos) {
+                assert!(self.schedule.get_next(self.tick).is_none());
+            }
+        }
+
+        self.last_commands_run = self.commands_run;
+        self.commands_run = 0;
+        self.ctx_pos = None;
+
+        if let Some(n) = self.next_pos.take() {
+            eprintln!("\nNow about to execute {}", &self.program[n.0].id);
+            self.call_stack.push((n.0, n.1));
+            self.ctx_pos = Some(n.2);
+
+            assert!(self.schedule.get_next(self.tick).is_none());
+
+            eprintln!(
+                "Stackptr at beginning of {} is {:?}",
+                self.program[n.0].id, self.stack_ptr_pos
+            );
+        }
+
+        if let Some(next_tick) = self.schedule.next_tick() {
+            assert!(self.tick <= next_tick);
+            self.tick = next_tick;
+
+            let (_, next) = self.schedule.get_next(self.tick).unwrap();
+            
+            let idx = self.get_func_idx(&next);
+
+            self.call_stack.push((idx, 0));
+            self.ctx_pos = None;
+        }
+    }
+
     pub fn finish_unwind(&mut self, top_func: String) {
         //let (top_func_idx, _) = self.call_stack.first().unwrap();
         //let top_func = self.program[*top_func_idx].id.to_string();
 
         loop {
             if self.call_stack.is_empty() {
-                self.tick += 1;
                 println!(
                     "Executed {} commands from function '{}'",
                     self.commands_run, top_func,
                 );
 
-                if let Some(ctx_pos) = self.ctx_pos {
-                    println!("Pos was {:?}", ctx_pos);
-                    if self.trigger_chain(ctx_pos) {
-                        break;
-                    }
-                }
-
-                self.last_commands_run = self.commands_run;
-                self.commands_run = 0;
-                self.ctx_pos = None;
-
-                if let Some(n) = self.next_pos.take() {
-                    eprintln!("\nNow about to execute {}", &self.program[n.0].id);
-                    self.call_stack.push((n.0, n.1));
-                    self.ctx_pos = Some(n.2);
-
-                    eprintln!(
-                        "Stackptr at beginning of {} is {:?}",
-                        self.program[n.0].id, self.stack_ptr_pos
-                    );
-                }
+                self.next_tick();
                 break;
             }
 
@@ -1636,13 +1744,13 @@ impl Interpreter {
             if self.program[*func_idx].cmds.len() == *cmd_idx {
                 self.call_stack.pop();
             } else {
-                break;
+                return;
             }
         }
     }
 
     pub fn halted(&self) -> bool {
-        self.call_stack.is_empty()
+        self.call_stack.is_empty() && self.schedule.is_empty()
     }
 }
 
