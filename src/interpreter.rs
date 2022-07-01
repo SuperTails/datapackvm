@@ -305,8 +305,8 @@ impl ExecResult {
     }
 }
 
-#[derive(Default)]
-pub struct NbtStorage(HashMap<StorageId, SNbtCompound>);
+#[derive(Default, Debug)]
+pub struct NbtStorage(pub HashMap<StorageId, SNbtCompound>);
 
 impl NbtStorage {
     pub fn set(&mut self, storage_id: StorageId, path: &NbtPath, value: SNbt) {
@@ -544,7 +544,7 @@ pub struct Interpreter {
     pub tick: u32,
 
     pub last_commands_run: usize,
-    commands_run: usize,
+    pub commands_run: usize,
 }
 
 impl Interpreter {
@@ -604,12 +604,24 @@ impl Interpreter {
         &self.program
     }
 
+    pub fn call_stack_depth(&self) -> usize {
+        self.call_stack.len()
+    }
+
+    pub fn call_stack_raw(&self) -> &[(usize, usize)] {
+        &self.call_stack
+    }
+
     pub fn call_stack(&self) -> Vec<(&Function, usize)> {
         self.call_stack
             .iter()
             .copied()
             .map(|(f, c)| (&self.program[f], c))
             .collect()
+    }
+
+    pub fn call_stack_top(&self) -> Option<(&Function, usize)> {
+        self.call_stack.last().map(|(f, i)| (&self.program[*f], *i))
     }
 
     fn set_next_pos(&mut self, func_idx: usize, pos: (i32, i32, i32)) -> Result<(), InterpError> {
@@ -932,6 +944,7 @@ impl Interpreter {
             Some(Block::Jukebox(v)) => {
                 let path = path.to_string();
                 if path == "RecordItem.tag.Memory" {
+                    //eprintln!("stored {:?} to {:?}", value, pos);
                     *v = value;
                     Ok(())
                 } else {
@@ -1326,6 +1339,8 @@ impl Interpreter {
                     .unwrap_or_else(|| todo!("{:?}", id))
                     .0;
                 self.call_stack.push((called_idx, 0));
+
+                //eprintln!("called {}", id);
                 //}
 
                 Ok(ExecResult::Unknown)
@@ -1334,8 +1349,6 @@ impl Interpreter {
                 let start = maybe_based(start, ctx.pos);
                 let end = maybe_based(end, ctx.pos);
                 let dest = maybe_based(dest, ctx.pos);
-
-                println!("{:?} {:?} {:?}", start, end, dest);
 
                 for (sx, dx) in (start.0..=end.0).zip(dest.0..) {
                     for (sy, dy) in (start.1..=end.1).zip(dest.1..) {
@@ -1487,6 +1500,9 @@ impl Interpreter {
                 target: _target,
             }) => {
                 let msg = self.eval_message(&message.components);
+                /*if msg == "Printed 222" {
+                    return Err(InterpError::BreakpointHit)
+                }*/
                 println!("\n{}\n", msg);
                 self.output.push(msg);
 
@@ -1514,26 +1530,22 @@ impl Interpreter {
                 } else if c == "# !INTERPRETER: UNREACHABLE" {
                     Err(InterpError::EnteredUnreachable)
                 } else if let Some(cond) = c.strip_prefix("# !INTERPRETER: ASSERT ") {
-                    /*let (c, is_unless) = if let Some(c) = cond.strip_prefix("unless ") {
-                        (c, true)
-                    } else if let Some(c) = c.strip_prefix("if ") {
-                        (c, false)
-                    } else {
-                        todo!()
-                    };
+                    let cond = ExecuteSubCommand::from_str(cond).unwrap();
 
-                    let cond = ExecuteSubCommand::from_str(c).unwrap();
-
-                    if !self.check_cond(&cond) {
-                        eprintln!("Currently at:");
-                        for (f, c) in self.call_stack.iter() {
-                            eprintln!("{}, {}", self.program[*f].id, c);
+                    if let ExecuteSubCommand::IfScoreMatches(cond) = cond {
+                        if !self.check_if_score_matches(&cond) {
+                            eprintln!("Currently at:");
+                            for (f, c) in self.call_stack.iter() {
+                                eprintln!("{}, {}", self.program[*f].id, c);
+                            }
+                            println!("{}", cond);
+                            return Err(InterpError::AssertionFailed);
                         }
-                        return Err(InterpError::AssertionFailed);
+                    } else {
+                        todo!("{:?}", cond)
                     }
 
-                    Ok(None)*/
-                    todo!("{:?}", cond)
+                    Ok(ExecResult::Unknown)
                 } else if c.contains("!INTERPRETER") {
                     todo!("{}", c)
                 } else {
@@ -1622,6 +1634,8 @@ impl Interpreter {
             }
 
             Command::Schedule(schedule) => {
+                println!("Scheduling {:?}", schedule.id);
+
                 let time = self.tick + schedule.delay as u32;
                 if schedule.replace {
                     self.schedule.schedule_replace(time, schedule.id.clone());
@@ -1653,7 +1667,7 @@ impl Interpreter {
 
     /// Executes the next command
     pub fn step(&mut self) -> Result<(), InterpError> {
-        if self.commands_run >= 30_000_000 {
+        if self.commands_run >= 60_000_000 {
             return Err(InterpError::MaxCommandsRun);
         }
 
@@ -1695,7 +1709,7 @@ impl Interpreter {
         }
 
         self.last_commands_run = self.commands_run;
-        self.commands_run = 0;
+        //self.commands_run = 0;
         self.ctx_pos = None;
 
         if let Some(n) = self.next_pos.take() {
