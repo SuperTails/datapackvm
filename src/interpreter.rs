@@ -69,7 +69,8 @@ fn calc_coord(coord: &Coord, base: i32) -> i32 {
 #[derive(Debug, Clone, PartialEq)]
 pub enum InterpError {
     OutOfBoundsEntity(String, i32, i32, i32),
-    MaxCommandsRun,
+    MaxTotalCommandsRun,
+    MaxTickCommandsRun,
     EnteredUnreachable,
     EnteredTodo,
     AssertionFailed,
@@ -87,7 +88,8 @@ impl std::fmt::Display for InterpError {
             InterpError::OutOfBoundsEntity(tag, x, y, z) => {
                 write!(f, "out of bounds entity {:?} at x={}, y={}, z={}", tag, x, y, z)
             }
-            InterpError::MaxCommandsRun => write!(f, "ran too many commands at once"),
+            InterpError::MaxTotalCommandsRun => write!(f, "ran too many total commands"),
+            InterpError::MaxTickCommandsRun => write!(f, "ran too many commands in a single tick"),
             InterpError::EnteredUnreachable => write!(f, "entered unreachable code"),
             InterpError::EnteredTodo => write!(f, "entered code not yet implemented"),
             InterpError::AssertionFailed => write!(f, "assertion failed"),
@@ -571,10 +573,17 @@ pub struct Interpreter {
     pub output: Vec<String>,
     pub tick: u32,
 
-    /// The total number of commands (ish) that have been run
+    /// The total number of commands that have been run (not exact)
     pub total_commands_run: u64,
-    /// The number of commands (ish) that have been run so far in the current tick
+    /// The number of commands that have been run so far in the current tick (not exact)
     pub tick_commands_run: u64,
+
+    /// The maximum total number of commands that can be run.
+    /// Reaching this limit causes the interpreter to return MaxTotalCommandsRun.
+    pub max_total_commands: u64,
+    /// The maximum number of commands that can be run in a single tick.
+    /// Reaching this limit causes the interpreter to return MaxTickCommandsRun.
+    pub max_tick_commands: u64,
 }
 
 impl Interpreter {
@@ -622,8 +631,13 @@ impl Interpreter {
             turtle_pos: (0, 0, 0),
             next_chain_pos: (0, 0, 0),
             next_pos: None,
+
             total_commands_run: 0,
             tick_commands_run: 0,
+
+            max_total_commands: 60_000_000,
+            max_tick_commands: 5_000_000,
+
             tick: 0,
             output: Vec::new(),
         }
@@ -1742,15 +1756,12 @@ impl Interpreter {
 
     /// Executes the next command
     pub fn step(&mut self) -> Result<(), InterpError> {
-        if self.total_commands_run >= 60_000_000 {
-            return Err(InterpError::MaxCommandsRun);
+        if self.total_commands_run >= self.max_total_commands {
+            return Err(InterpError::MaxTotalCommandsRun);
         }
-        if self.tick_commands_run >= 1_000_000 {
-            return Err(InterpError::MaxCommandsRun);
+        if self.tick_commands_run >= self.max_tick_commands {
+            return Err(InterpError::MaxTickCommandsRun);
         }
-        /*if self.tick_commands_run >= 60_000_000 {
-            return Err(InterpError::MaxCommandsRun);
-        }*/
 
         let (top_func_idx, _) = self.call_stack.first().unwrap();
         let top_func = self.program[*top_func_idx].id.to_string();
