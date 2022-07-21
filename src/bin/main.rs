@@ -25,7 +25,7 @@ fn run(path: &Path) {
 
 	loop {
 		print!("> ");
-		stdout.flush();
+		stdout.flush().unwrap();
 		let mut input = String::new();
 		stdin.read_line(&mut input).unwrap();
 		let input = input.trim();

@@ -7,11 +7,17 @@ struct Arena<T> {
 	positions: HashMap<T, usize>,
 }
 
-impl<T: std::clone::Clone + PartialEq + Eq + std::hash::Hash> Arena<T> {
+impl<T> Arena<T> {
 	pub fn new() -> Self {
 		Arena { values: Default::default(), positions: Default::default() }
 	}
 
+	pub fn len(&self) -> usize {
+		self.values.len()
+	}
+}
+
+impl<T: std::clone::Clone + PartialEq + Eq + std::hash::Hash> Arena<T> {
 	pub fn intern(&mut self, t: T) -> usize {
 		if let Some(idx) = self.positions.get(&t) {
 			*idx
@@ -21,17 +27,20 @@ impl<T: std::clone::Clone + PartialEq + Eq + std::hash::Hash> Arena<T> {
 			self.values.len() - 1
 		}
 	}
+}
 
-	pub fn len(&self) -> usize {
-		self.values.len()
+impl<T> Default for Arena<T> {
+	fn default() -> Self {
+		Self::new()
 	}
 }
 
+#[derive(Default)]
 pub struct ScoreArena(Arena<(ScoreHolder, Objective)>);
 
 impl ScoreArena {
 	pub fn new() -> Self {
-		ScoreArena(Arena::new())
+		Self::default()
 	}
 
 	pub fn intern(&mut self, h: ScoreHolder, o: Objective) -> ScoreId {
@@ -265,7 +274,7 @@ pub struct ParsedFunction {
 
 impl ParsedFunction {
 	pub fn parse(func: Function, sa: &mut ScoreArena, program: &[Function]) -> Self {
-		let mut cmds = func.cmds.into_iter().map(|c| ParsedCommand::parse(c, sa, program)).collect();
+		let cmds = func.cmds.into_iter().map(|c| ParsedCommand::parse(c, sa, program)).collect();
 		ParsedFunction { id: func.id, cmds }
 	}
 }

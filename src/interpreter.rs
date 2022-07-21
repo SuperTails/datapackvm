@@ -126,21 +126,6 @@ pub enum BreakKind {
     Access,
 }
 
-#[derive(Default, Debug)]
-pub struct Scoreboard2(pub HashMap<Objective, HashMap<ScoreHolder, i32>>);
-
-impl Scoreboard2 {
-    pub fn get(&self, holder: &ScoreHolder, obj: &Objective) -> Option<i32> {
-        let scores = self.0.get(obj)?;
-        scores.get(holder).copied()
-    }
-
-    pub fn set(&mut self, holder: &ScoreHolder, obj: &Objective, value: i32) {
-        let scores = self.0.get_mut(obj).unwrap_or_else(|| panic!("setting a variable in nonexistent objective {:?}", obj));
-        scores.insert(holder.to_owned(), value);
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CmdBlockKind {
     Impulse,
