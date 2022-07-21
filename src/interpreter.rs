@@ -1,7 +1,7 @@
-use datapack_common::functions::command::commands::Execute;
 use datapack_common::functions::command::data_modify_kinds::SetFrom;
 use datapack_common::functions::command::execute_sub_commands::*;
 use datapack_common::functions::command::*;
+use datapack_common::functions::command::commands::*;
 use datapack_common::functions::command_components::*;
 use datapack_common::functions::raw_text::TextComponent;
 use datapack_common::functions::*;
@@ -12,6 +12,8 @@ use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::str::FromStr;
+
+use crate::parsed::*;
 
 fn get_name(target: &ScoreboardTarget) -> Option<&ScoreHolder> {
     match target {
@@ -66,7 +68,7 @@ fn calc_coord(coord: &Coord, base: i32) -> i32 {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum InterpError {
-    OutOfBoundsAccess(i32, i32, i32),
+    OutOfBoundsEntity(String, i32, i32, i32),
     MaxCommandsRun,
     EnteredUnreachable,
     EnteredTodo,
@@ -76,13 +78,14 @@ pub enum InterpError {
     InvalidBranch(usize),
     MultiBranch(FunctionIdent, Option<FunctionIdent>),
     NoBlockData(i32, i32, i32, String),
+    UndefinedVar(ScoreHolder, Objective),
 }
 
 impl std::fmt::Display for InterpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            InterpError::OutOfBoundsAccess(x, y, z) => {
-                write!(f, "out of bounds access at x={}, y={}, z={}", x, y, z)
+            InterpError::OutOfBoundsEntity(tag, x, y, z) => {
+                write!(f, "out of bounds entity {:?} at x={}, y={}, z={}", tag, x, y, z)
             }
             InterpError::MaxCommandsRun => write!(f, "ran too many commands at once"),
             InterpError::EnteredUnreachable => write!(f, "entered unreachable code"),
@@ -107,6 +110,9 @@ impl std::fmt::Display for InterpError {
             InterpError::NoBlockData(x, y, z, path) => {
                 write!(f, "couldn't read path {} at {} {} {}", path, x, y, z)
             }
+            InterpError::UndefinedVar(holder, obj) => {
+                write!(f, "undefined variable {:?} {:?}", holder, obj)
+            }
         }
     }
 }
@@ -121,9 +127,9 @@ pub enum BreakKind {
 }
 
 #[derive(Default, Debug)]
-pub struct Scoreboard(pub HashMap<Objective, HashMap<ScoreHolder, i32>>);
+pub struct Scoreboard2(pub HashMap<Objective, HashMap<ScoreHolder, i32>>);
 
-impl Scoreboard {
+impl Scoreboard2 {
     pub fn get(&self, holder: &ScoreHolder, obj: &Objective) -> Option<i32> {
         let scores = self.0.get(obj)?;
         scores.get(holder).copied()
@@ -164,7 +170,7 @@ impl FromStr for Facing {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CommandBlock {
+pub struct CommandBlock {
     kind: CmdBlockKind,
     facing: Facing,
     command: String,
@@ -172,7 +178,7 @@ struct CommandBlock {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Block {
+pub enum Block {
     Command(CommandBlock),
     Redstone,
     Jukebox(i32),
@@ -452,7 +458,7 @@ pub fn get_nbt_from_tag_mut<'a>(mut tag: &'a mut SNbt, path: &[NbtPathPart]) -> 
 }
 
 #[derive(Debug)]
-struct ScheduledFunc(pub u32, pub FunctionIdent);
+struct ScheduledFunc(pub u32, pub usize);
 
 impl PartialEq for ScheduledFunc {
     fn eq(&self, other: &Self) -> bool {
@@ -478,7 +484,7 @@ impl Ord for ScheduledFunc {
 pub struct Schedule(BinaryHeap<Reverse<ScheduledFunc>>);
 
 impl Schedule {
-    pub fn schedule_replace(&mut self, time: u32, func: FunctionIdent) {
+    pub fn schedule_replace(&mut self, time: u32, func: usize) {
         if self.0.iter().any(|Reverse(f)| f.1 == func) {
             todo!()
         }
@@ -486,7 +492,7 @@ impl Schedule {
         self.schedule_append(time, func);
     }
 
-    pub fn schedule_append(&mut self, time: u32, func: FunctionIdent) {
+    pub fn schedule_append(&mut self, time: u32, func: usize) {
         self.0.push(Reverse(ScheduledFunc(time, func)));
     }
 
@@ -494,7 +500,7 @@ impl Schedule {
         self.0.peek().map(|f| f.0.0)
     }
 
-    pub fn get_next(&mut self, time: u32) -> Option<(u32, FunctionIdent)> {
+    pub fn get_next(&mut self, time: u32) -> Option<(u32, usize)> {
         if let Some(Reverse(next)) = self.0.peek() {
             assert!(next.0 >= time);
             if next.0 == time {
@@ -513,14 +519,51 @@ impl Schedule {
     }
 }
 
+pub struct Scoreboard {
+    values: Vec<i32>,
+    init: Vec<bool>,
+}
+
+impl Scoreboard {
+    pub fn new(len: usize) -> Self {
+        Scoreboard {
+            values: vec![0; len],
+            init: vec![false; len]
+        }
+    }
+
+    pub fn get(&self, score: ScoreId) -> Option<i32> {
+        if self.init.len() <= score.0 {
+            None
+        } else if self.init[score.0] {
+            Some(self.values[score.0])
+        } else {
+            None
+        }
+    }
+
+    pub fn set(&mut self, score: ScoreId, value: i32) {
+        if score.0 >= self.init.len() {
+            self.init.resize(score.0 + 1, false);
+            self.values.resize(score.0 + 1, 0);
+        }
+
+        self.init[score.0] = true;
+        self.values[score.0] = value;
+    }
+}
+
 pub struct Interpreter {
-    pub program: Vec<Function>,
+    pub program: Vec<ParsedFunction>,
+    pub score_arena: ScoreArena,
 
     pub indiv_time: HashMap<FunctionIdent, usize>,
 
     pub scoreboard: Scoreboard,
 
     pub nbt_storage: NbtStorage,
+
+    func_ids: Vec<Function>,
 
     schedule: Schedule,
 
@@ -543,8 +586,10 @@ pub struct Interpreter {
     pub output: Vec<String>,
     pub tick: u32,
 
-    pub last_commands_run: usize,
-    pub commands_run: usize,
+    /// The total number of commands (ish) that have been run
+    pub total_commands_run: u64,
+    /// The number of commands (ish) that have been run so far in the current tick
+    pub tick_commands_run: u64,
 }
 
 impl Interpreter {
@@ -565,11 +610,21 @@ impl Interpreter {
     }
 
     pub fn new(program: Vec<Function>, start_func_idx: usize) -> Self {
+        let mut score_arena = ScoreArena::new();
+
+        let p_program = program.clone().into_iter().map(|f| ParsedFunction::parse(f, &mut score_arena, &program)).collect();
+
+        let len = score_arena.len();
+
+        let func_ids = program.iter().map(|f| Function { id: f.id.clone(), cmds: Vec::new() }).collect::<Vec<_>>();
+
         Interpreter {
-            program,
+            program: p_program,
+            score_arena,
             ctx_pos: None,
             call_stack: vec![(start_func_idx, 0)],
             schedule: Schedule::default(),
+            func_ids,
             blocks: HashMap::new(),
             indiv_time: Default::default(),
             memory_ptr_pos: Default::default(),
@@ -577,13 +632,13 @@ impl Interpreter {
             local_ptr_pos: Default::default(),
             stack_ptr_pos: Default::default(),
             global_ptr_pos: Default::default(),
-            scoreboard: Scoreboard::default(),
+            scoreboard: Scoreboard::new(len),
             nbt_storage: NbtStorage::default(),
             turtle_pos: (0, 0, 0),
             next_chain_pos: (0, 0, 0),
             next_pos: None,
-            last_commands_run: 0,
-            commands_run: 0,
+            total_commands_run: 0,
+            tick_commands_run: 0,
             tick: 0,
             output: Vec::new(),
         }
@@ -600,7 +655,7 @@ impl Interpreter {
         Self::new(program, 0)
     }
 
-    pub fn program(&self) -> &[Function] {
+    pub fn program(&self) -> &[ParsedFunction] {
         &self.program
     }
 
@@ -612,7 +667,17 @@ impl Interpreter {
         &self.call_stack
     }
 
-    pub fn call_stack(&self) -> Vec<(&Function, usize)> {
+    pub fn set_named_score(&mut self, holder: &ScoreHolder, obj: &Objective, value: i32) {
+        let s = self.score_arena.intern(holder.clone(), obj.clone());
+        self.scoreboard.set(s, value)
+    }
+
+    pub fn get_named_score(&mut self, holder: &ScoreHolder, obj: &Objective) -> Option<i32> {
+        let s = self.score_arena.intern(holder.clone(), obj.clone());
+        self.scoreboard.get(s)
+    }
+
+    pub fn call_stack(&self) -> Vec<(&ParsedFunction, usize)> {
         self.call_stack
             .iter()
             .copied()
@@ -620,7 +685,7 @@ impl Interpreter {
             .collect()
     }
 
-    pub fn call_stack_top(&self) -> Option<(&Function, usize)> {
+    pub fn call_stack_top(&self) -> Option<(&ParsedFunction, usize)> {
         self.call_stack.last().map(|(f, i)| (&self.program[*f], *i))
     }
 
@@ -644,7 +709,7 @@ impl Interpreter {
         Ok(())
     }
 
-    pub fn next_command(&self) -> Option<&Command> {
+    pub fn next_command(&self) -> Option<&ParsedCommand> {
         if !self.halted() {
             let (func_idx, cmd_idx) = self.call_stack.last().unwrap();
             Some(&self.program[*func_idx].cmds[*cmd_idx])
@@ -653,27 +718,38 @@ impl Interpreter {
         }
     }
 
-    fn eval_message(&self, msg: &[TextComponent]) -> String {
-        let mut result = String::new();
-        let score_getter =
-            |name: &ScoreHolder, obj: &Objective| -> Option<i32> { self.scoreboard.get(name, obj) };
+    fn eval_message(&self, msg: &[TextComponent]) -> Result<String, InterpError> {
+        // TODO: ugly error handling hack
+        let mut undef_var = None;
 
-        for s in msg.iter().map(|m| m.as_string(&score_getter).unwrap()) {
+        let mut result = String::new();
+        let mut score_getter =
+            |name: &ScoreHolder, obj: &Objective| -> Option<i32> {
+                let id = self.score_arena.get(name.clone(), obj.clone());
+                let value = id.and_then(|sc| self.get_score(sc));
+                if value.is_none() && undef_var.is_none() {
+                    undef_var = Some(InterpError::UndefinedVar(name.clone(), obj.clone()));
+                }
+                Some(value.unwrap_or(0))
+            };
+
+        for s in msg.iter().map(|m| m.as_string(&mut score_getter).unwrap()) {
             result.push_str(&s);
         }
-        result
+
+        if let Some(undef_var) = undef_var {
+            Err(undef_var)
+        } else {
+            Ok(result)
+        }
     }
 
-    pub fn get_score(&self, holder: &ScoreHolder, obj: &Objective) -> Result<i32, String> {
-        self.scoreboard
-            .get(holder, obj)
-            .ok_or_else(|| format!("read from uninitialized variable {} {}", holder, obj))
+    pub fn get_score(&self, score_id: ScoreId) -> Option<i32> {
+        self.scoreboard.get(score_id)
     }
-
-    fn check_if_score_matches(&self, cond: &IfScoreMatches) -> bool {
-        let target = get_target_name(&cond.target).unwrap();
-
-        let score = self.get_score(target, &cond.target_obj).unwrap();
+   
+    fn check_if_score_matches(&self, cond: &PIfScoreMatches) -> bool {
+        let score = self.get_score(cond.target).unwrap();
 
         let result = cond.range.contains(score);
 
@@ -684,12 +760,12 @@ impl Interpreter {
         }
     }
 
-    fn check_if_score_relation(&self, cond: &IfScoreRelation) -> bool {
+    fn check_if_score_relation(&self, cond: &PIfScoreRelation) -> bool {
         let lhs = self
-            .get_score(get_target_name(&cond.target).unwrap(), &cond.target_obj)
+            .get_score(cond.target)
             .unwrap();
         let rhs = self
-            .get_score(get_target_name(&cond.source).unwrap(), &cond.source_obj)
+            .get_score(cond.source)
             .unwrap();
 
         let result = cond.relation.evaluate(lhs, rhs);
@@ -737,12 +813,12 @@ impl Interpreter {
             {
                 let cmd = (pos.0, pos.1 - 1, pos.2);
                 println!("Checking for command block at {:?}", cmd);
-                let b = self.blocks.get(&cmd).unwrap_or_else(|| panic!("{:?}", cmd));
-                if let Block::Command(CommandBlock {
+                let b = self.blocks.get(&cmd);
+                if let Some(Block::Command(CommandBlock {
                     kind: CmdBlockKind::Impulse,
                     command,
                     ..
-                }) = b
+                })) = b
                 {
                     let c = command.parse::<Command>().unwrap();
                     let id = if let Command::FuncCall(FuncCall { id }) = c {
@@ -818,6 +894,14 @@ impl Interpreter {
         } else {
             false
         }
+    }
+
+    pub fn get_block(&self, pos: (i32, i32, i32)) -> Option<&Block> {
+        self.blocks.get(&pos)
+    }
+
+    pub fn set_block_raw(&mut self, pos: (i32, i32, i32), block: Block) {
+        self.blocks.insert(pos, block);
     }
 
     pub fn get_func_idx(&self, id: &FunctionIdent) -> usize {
@@ -968,13 +1052,13 @@ impl Interpreter {
 
     fn run_execute(
         &mut self,
-        Execute { subcommands, run }: &Execute,
+        PExecute { subcommands, run }: &PExecute,
         ctx: &mut Context,
     ) -> Result<ExecResult, InterpError> {
         let mut ctx = ctx.clone();
 
-        let run = &run.0;
-        let subcommands = &subcommands.0[..];
+        let run = &run;
+        let subcommands = &subcommands[..];
 
         let prev_subcommands = if run.is_some() {
             subcommands
@@ -986,37 +1070,37 @@ impl Interpreter {
 
         for subcmd in prev_subcommands.iter() {
             match subcmd {
-                ExecuteSubCommand::IfScoreMatches(cond) => {
+                PExecuteSubCmd::IfScoreMatches(cond) => {
                     if !self.check_if_score_matches(cond) {
                         return Ok(ExecResult::Interrupted);
                     }
                 }
-                ExecuteSubCommand::IfScoreRelation(cond) => {
+                PExecuteSubCmd::IfScoreRelation(cond) => {
                     if !self.check_if_score_relation(cond) {
                         return Ok(ExecResult::Interrupted);
                     }
                 }
-                ExecuteSubCommand::IfBlock(cond) => {
+                PExecuteSubCmd::IfBlock(cond) => {
                     if !self.check_if_block(cond) {
                         return Ok(ExecResult::Interrupted);
                     }
                 }
-                ExecuteSubCommand::IfData(cond) => {
+                PExecuteSubCmd::IfData(cond) => {
                     if !self.check_if_data(cond) {
                         return Ok(ExecResult::Interrupted);
                     }
                 }
-                ExecuteSubCommand::At(At { target }) => {
+                PExecuteSubCmd::At(At { target }) => {
                     ctx.pos = Some(self.get_pos(target));
                 }
-                ExecuteSubCommand::As(As { target }) => {
+                PExecuteSubCmd::As(As { target }) => {
                     ctx.ident = Some(self.get_ident(target));
                 }
-                ExecuteSubCommand::StoreScore(..) | ExecuteSubCommand::StoreStorage(..) => {
+                PExecuteSubCmd::StoreScore(..) | PExecuteSubCmd::StoreStorage(..) => {
                     assert!(store.is_none());
                     store = Some(subcmd);
                 }
-                _ => todo!("{:?}", subcmd),
+                _ => todo!(),
             }
         }
 
@@ -1026,7 +1110,7 @@ impl Interpreter {
             let subcmd = subcommands.last().unwrap();
 
             match subcmd {
-                ExecuteSubCommand::IfScoreMatches(cond) => {
+                PExecuteSubCmd::IfScoreMatches(cond) => {
                     let result = self.check_if_score_matches(cond);
 
                     if result {
@@ -1035,7 +1119,7 @@ impl Interpreter {
                         ExecResult::Failed
                     }
                 }
-                ExecuteSubCommand::IfScoreRelation(cond) => {
+                PExecuteSubCmd::IfScoreRelation(cond) => {
                     let result = self.check_if_score_relation(cond);
 
                     if result {
@@ -1044,7 +1128,7 @@ impl Interpreter {
                         ExecResult::Failed
                     }
                 }
-                ExecuteSubCommand::IfBlock(cond) => {
+                PExecuteSubCmd::IfBlock(cond) => {
                     let result = self.check_if_block(cond);
 
                     if result {
@@ -1053,16 +1137,15 @@ impl Interpreter {
                         ExecResult::Failed
                     }
                 }
-                _ => todo!("{:?}", subcmd),
+                _ => todo!(),
             }
         };
 
         if let Some(store) = store {
             match store {
-                ExecuteSubCommand::StoreScore(StoreScore {
+                PExecuteSubCmd::StoreScore(PStoreScore {
                     is_success,
                     target,
-                    target_obj,
                 }) => {
                     let value = if *is_success {
                         end_result.get_success().map(|s| s as i32)
@@ -1071,9 +1154,7 @@ impl Interpreter {
                     };
 
                     if let Some(value) = value {
-                        let target = get_target_name(target).unwrap();
-
-                        self.scoreboard.set(target, target_obj, value);
+                        self.scoreboard.set(*target, value);
 
                         // TODO:
                         Ok(ExecResult::Unknown)
@@ -1081,7 +1162,7 @@ impl Interpreter {
                         Ok(ExecResult::Interrupted)
                     }
                 }
-                ExecuteSubCommand::StoreStorage(StoreStorage {
+                PExecuteSubCmd::StoreStorage(StoreStorage {
                     is_success,
                     target,
                     path,
@@ -1147,6 +1228,18 @@ impl Interpreter {
                                 _ => todo!("{:?}", path),
                             }
 
+                            // If an entity moves too far, it will die or go outside of the loaded chunks.
+                            // Either way, that means it can't be used anymore, so it's an error.
+                            if !(-512..512).contains(&pos.0) {
+                                return Err(InterpError::OutOfBoundsEntity(target.clone(), pos.0, pos.1, pos.2));
+                            }
+                            if !(-64..256).contains(&pos.1) {
+                                return Err(InterpError::OutOfBoundsEntity(target.clone(), pos.0, pos.1, pos.2));
+                            }
+                            if !(-512..512).contains(&pos.2) {
+                                return Err(InterpError::OutOfBoundsEntity(target.clone(), pos.0, pos.1, pos.2));
+                            }
+
                             Ok(ExecResult::Unknown)
                         }
                         DataTarget::Storage(storage_id) => {
@@ -1166,17 +1259,20 @@ impl Interpreter {
     }
 
     pub fn execute_cmd(&mut self, cmd: &Command) -> Result<ExecResult, InterpError> {
+        let func_ids = self.program.iter().map(|f| Function { id: f.id.clone(), cmds: Vec::new() }).collect::<Vec<_>>();
+
+        let cmd = ParsedCommand::parse(cmd.clone(), &mut self.score_arena, &func_ids);
+
         let mut ctx = Context::default();
 
-        self.execute_cmd_ctx(cmd, &mut ctx)
+        self.execute_cmd_ctx(&cmd, &mut ctx)
     }
 
     fn execute_cmd_ctx(
         &mut self,
-        cmd: &Command,
+        cmd: &ParsedCommand,
         ctx: &mut Context,
     ) -> Result<ExecResult, InterpError> {
-        use datapack_common::functions::command::commands::*;
 
         /*for (f, i) in self.call_stack.iter() {
             print!("({}, {}), ", self.program[*f].id, i);
@@ -1192,7 +1288,7 @@ impl Interpreter {
         }*/
 
         match cmd {
-            Command::Gamerule(Gamerule { rule, value }) => {
+            ParsedCommand::Gamerule(Gamerule { rule, value }) => {
                 // TODO:
                 match rule.as_str() {
                     "maxCommandChainLength" => {
@@ -1203,60 +1299,51 @@ impl Interpreter {
                     _ => todo!("{} {:?}", rule, value),
                 }
             }
-            Command::ScoreAdd(ScoreAdd {
+            &ParsedCommand::ScoreAdd(PScoreAdd {
                 target,
-                target_obj,
                 score,
                 remove,
             }) => {
-                let target = get_name(target).unwrap();
+                let mut lhs = self.get_score(target).unwrap();
 
-                let mut lhs = self.get_score(target, target_obj).unwrap();
-
-                if *remove {
-                    lhs = lhs.wrapping_sub(*score);
+                if remove {
+                    lhs = lhs.wrapping_sub(score);
                 } else {
-                    lhs = lhs.wrapping_add(*score);
+                    lhs = lhs.wrapping_add(score);
                 }
 
-                self.scoreboard.set(target, target_obj, lhs);
+                self.scoreboard.set(target, lhs);
 
                 Ok(ExecResult::Unknown)
             }
-            Command::ScoreOp(ScoreOp {
+            &ParsedCommand::ScoreOp(PScoreOp {
                 target,
-                target_obj,
                 op,
                 source,
-                source_obj,
             }) => {
-                let target = get_name(target).unwrap();
-                let source = get_name(source).unwrap();
-
-                let rhs = self.get_score(source, source_obj).unwrap();
+                let rhs = self.get_score(source).unwrap_or_else(|| panic!("{:?}", self.score_arena.get_id(source)));
 
                 match op {
                     ScoreOpKind::Assign => {
-                        self.scoreboard.set(target, target_obj, rhs);
+                        self.scoreboard.set(target, rhs);
                     }
                     ScoreOpKind::Add => {
-
-                        let mut val = self.get_score(target, target_obj).unwrap();
+                        let mut val = self.get_score(target).unwrap();
                         val = val.wrapping_add(rhs);
-                        self.scoreboard.set(target, target_obj, val);
+                        self.scoreboard.set(target, val);
                     }
                     ScoreOpKind::Sub => {
-                        let mut val = self.get_score(target, target_obj).unwrap();
+                        let mut val = self.get_score(target).unwrap();
                         val = val.wrapping_sub(rhs);
-                        self.scoreboard.set(target, target_obj, val);
+                        self.scoreboard.set(target, val);
                     }
                     ScoreOpKind::Mul => {
-                        let mut val = self.get_score(target, target_obj).unwrap();
+                        let mut val = self.get_score(target).unwrap();
                         val = val.wrapping_mul(rhs);
-                        self.scoreboard.set(target, target_obj, val);
+                        self.scoreboard.set(target, val);
                     }
                     ScoreOpKind::Div => {
-                        let lhs = self.get_score(target, target_obj).unwrap();
+                        let lhs = self.get_score(target).unwrap();
 
                         // Minecraft div rounds towards -infinity
                         let val = if rhs == 0 {
@@ -1272,10 +1359,10 @@ impl Interpreter {
                             }
                         };
 
-                        self.scoreboard.set(target, target_obj, val);
+                        self.scoreboard.set(target, val);
                     }
                     ScoreOpKind::Mod => {
-                        let lhs = self.get_score(target, target_obj).unwrap();
+                        let lhs = self.get_score(target).unwrap();
 
                         let quot = if rhs == 0 {
                             lhs
@@ -1292,29 +1379,29 @@ impl Interpreter {
 
                         let rem = lhs.wrapping_sub(quot.wrapping_mul(rhs));
 
-                        self.scoreboard.set(target, target_obj, rem);
+                        self.scoreboard.set(target, rem);
                     }
                     ScoreOpKind::Min => {
-                        let mut val = self.get_score(target, target_obj).unwrap();
+                        let mut val = self.get_score(target).unwrap();
                         val = val.min(rhs);
-                        self.scoreboard.set(target, target_obj, val);
+                        self.scoreboard.set(target, val);
                     }
                     ScoreOpKind::Max => {
-                        let mut val = self.get_score(target, target_obj).unwrap();
+                        let mut val = self.get_score(target).unwrap();
                         val = val.max(rhs);
-                        self.scoreboard.set(target, target_obj, val);
+                        self.scoreboard.set(target, val);
                     }
                     ScoreOpKind::Swap => {
-                        let lhs = self.get_score(target, target_obj).unwrap();
+                        let lhs = self.get_score(target).unwrap();
 
-                        self.scoreboard.set(source, source_obj, lhs);
-                        self.scoreboard.set(target, target_obj, rhs);
+                        self.scoreboard.set(source, lhs);
+                        self.scoreboard.set(target, rhs);
                     }
                 }
 
                 Ok(ExecResult::Unknown)
             }
-            Command::FuncCall(FuncCall { id }) => {
+            &ParsedCommand::FuncCall(called_idx) => {
                 //if id"stdout:putc" {
                 //    todo!();
                 /*
@@ -1331,13 +1418,15 @@ impl Interpreter {
                 }
                 */
                 //} else {
-                let called_idx = self
+                /*let called_idx = self
                     .program
                     .iter()
                     .enumerate()
                     .find(|(_, f)| &f.id == id)
                     .unwrap_or_else(|| todo!("{:?}", id))
                     .0;
+                self.call_stack.push((called_idx, 0));*/
+
                 self.call_stack.push((called_idx, 0));
 
                 //eprintln!("called {}", id);
@@ -1345,7 +1434,7 @@ impl Interpreter {
 
                 Ok(ExecResult::Unknown)
             }
-            Command::Clone(Clone { start, end, dest }) => {
+            ParsedCommand::Clone(Clone { start, end, dest }) => {
                 let start = maybe_based(start, ctx.pos);
                 let end = maybe_based(end, ctx.pos);
                 let dest = maybe_based(dest, ctx.pos);
@@ -1372,7 +1461,7 @@ impl Interpreter {
 
                 Ok(ExecResult::Unknown)
             }
-            Command::Fill(Fill {
+            ParsedCommand::Fill(Fill {
                 start,
                 end,
                 block,
@@ -1402,7 +1491,7 @@ impl Interpreter {
 
                 Ok(ExecResult::Unknown)
             }
-            Command::DataGet(DataGet {
+            ParsedCommand::DataGet(DataGet {
                 target,
                 path,
                 scale,
@@ -1434,7 +1523,7 @@ impl Interpreter {
                     _ => todo!("{:?}", target),
                 }
             }
-            Command::DataModify(DataModify { target, path, kind }) => {
+            ParsedCommand::DataModify(DataModify { target, path, kind }) => {
                 use datapack_common::functions::command::data_modify_kinds::Set;
 
                 match target {
@@ -1474,32 +1563,27 @@ impl Interpreter {
                     _ => todo!(),
                 }
             }
-            Command::ScoreSet(ScoreSet {
+            &ParsedCommand::ScoreSet(PScoreSet {
                 target,
-                target_obj,
                 score,
             }) => {
-                let target = get_name(target).unwrap();
-
-                self.scoreboard.set(target, target_obj, *score);
+                self.scoreboard.set(target, score);
 
                 Ok(ExecResult::Unknown)
             }
-            Command::ScoreGet(ScoreGet { target, target_obj }) => {
-                let target = get_name(target).unwrap();
-
+            &ParsedCommand::ScoreGet(PScoreGet { target }) => {
                 let result = self
                     .scoreboard
-                    .get(target, target_obj)
-                    .unwrap_or_else(|| panic!("{:?} {:?}", target, target_obj));
+                    .get(target)
+                    .unwrap_or_else(|| panic!("{:?}", target));
 
                 Ok(ExecResult::Succeeded(result))
             }
-            Command::Tellraw(Tellraw {
+            ParsedCommand::Tellraw(Tellraw {
                 message,
                 target: _target,
             }) => {
-                let msg = self.eval_message(&message.components);
+                let msg = self.eval_message(&message.components)?;
                 /*if msg == "Printed 222" {
                     return Err(InterpError::BreakpointHit)
                 }*/
@@ -1508,15 +1592,15 @@ impl Interpreter {
 
                 Ok(ExecResult::Unknown)
             }
-            Command::SetBlock(SetBlock { pos, block, kind }) => {
+            ParsedCommand::SetBlock(SetBlock { pos, block, kind }) => {
                 let pos = maybe_based(pos, ctx.pos);
 
                 self.set_block(pos, block, *kind);
 
                 Ok(ExecResult::Unknown)
             }
-            Command::Execute(cmd) => self.run_execute(cmd, ctx),
-            Command::Comment(c) => {
+            ParsedCommand::Execute(cmd) => self.run_execute(cmd, ctx),
+            ParsedCommand::Comment(c) => {
                 let c = c.to_string();
 
                 if let Some(c) = c.strip_prefix("# !INTERPRETER: SYNC ") {
@@ -1532,8 +1616,10 @@ impl Interpreter {
                 } else if let Some(cond) = c.strip_prefix("# !INTERPRETER: ASSERT ") {
                     let cond = ExecuteSubCommand::from_str(cond).unwrap();
 
-                    if let ExecuteSubCommand::IfScoreMatches(cond) = cond {
-                        if !self.check_if_score_matches(&cond) {
+                    let p_cond = PExecuteSubCmd::parse(cond.clone(), &mut self.score_arena);
+
+                    if let PExecuteSubCmd::IfScoreMatches(p_cond) = p_cond {
+                        if !self.check_if_score_matches(&p_cond) {
                             eprintln!("Currently at:");
                             for (f, c) in self.call_stack.iter() {
                                 eprintln!("{}, {}", self.program[*f].id, c);
@@ -1552,11 +1638,11 @@ impl Interpreter {
                     Ok(ExecResult::Unknown)
                 }
             }
-            Command::Kill(_) => {
+            ParsedCommand::Kill(_) => {
                 // TODO:
                 Ok(ExecResult::Unknown)
             }
-            Command::Summon(Summon { entity, pos, data }) => {
+            ParsedCommand::Summon(Summon { entity, pos, data }) => {
                 let pos = pos
                     .0
                     .as_ref()
@@ -1597,19 +1683,23 @@ impl Interpreter {
                     todo!()
                 }
             }
-            Command::ObjAdd(ObjAdd(obj, crit)) => {
-                if crit == &ObjectiveCriterion::Dummy {
+            ParsedCommand::ObjAdd(ObjAdd(_obj, _crit)) => {
+                // TODO:
+                /*if crit == &ObjectiveCriterion::Dummy {
                     self.scoreboard.0.insert(obj.clone(), HashMap::new());
                     Ok(ExecResult::Unknown)
                 } else {
                     todo!()
-                }
-            }
-            Command::ObjRemove(obj) => {
-                self.scoreboard.0.remove(&obj.0);
+                }*/
                 Ok(ExecResult::Unknown)
             }
-            Command::Teleport(Teleport { target, pos }) => {
+            ParsedCommand::ObjRemove(_obj) => {
+                // TODO:
+                /*self.scoreboard.0.remove(&obj.0);
+                Ok(ExecResult::Unknown)*/
+                Ok(ExecResult::Unknown)
+            }
+            ParsedCommand::Teleport(Teleport { target, pos }) => {
                 let target = match target {
                     Target::Selector(Selector {
                         var: SelectorVariable::ThisEntity,
@@ -1633,7 +1723,7 @@ impl Interpreter {
                 Ok(ExecResult::Unknown)
             }
 
-            Command::Schedule(schedule) => {
+            ParsedCommand::Schedule(schedule) => {
                 println!("Scheduling {:?}", schedule.id);
 
                 let time = self.tick + schedule.delay as u32;
@@ -1646,7 +1736,7 @@ impl Interpreter {
                 Ok(ExecResult::Unknown)
             }
 
-            cmd => todo!("{}", cmd),
+            cmd => todo!(),
         }
     }
 
@@ -1667,9 +1757,15 @@ impl Interpreter {
 
     /// Executes the next command
     pub fn step(&mut self) -> Result<(), InterpError> {
-        if self.commands_run >= 60_000_000 {
+        if self.total_commands_run >= 60_000_000 {
             return Err(InterpError::MaxCommandsRun);
         }
+        if self.tick_commands_run >= 1_000_000 {
+            return Err(InterpError::MaxCommandsRun);
+        }
+        /*if self.tick_commands_run >= 60_000_000 {
+            return Err(InterpError::MaxCommandsRun);
+        }*/
 
         let (top_func_idx, _) = self.call_stack.first().unwrap();
         let top_func = self.program[*top_func_idx].id.to_string();
@@ -1689,7 +1785,8 @@ impl Interpreter {
         };
 
         // TODO: This doesn't get incremented on breakpoints
-        self.commands_run += 1;
+        self.total_commands_run += 1;
+        self.tick_commands_run += 1;
 
         self.execute_cmd_ctx(cmd, &mut ctx)?;
 
@@ -1708,8 +1805,8 @@ impl Interpreter {
             }
         }
 
-        self.last_commands_run = self.commands_run;
-        //self.commands_run = 0;
+        self.tick_commands_run = 0;
+
         self.ctx_pos = None;
 
         if let Some(n) = self.next_pos.take() {
@@ -1731,9 +1828,7 @@ impl Interpreter {
 
             let (_, next) = self.schedule.get_next(self.tick).unwrap();
             
-            let idx = self.get_func_idx(&next);
-
-            self.call_stack.push((idx, 0));
+            self.call_stack.push((next, 0));
             self.ctx_pos = None;
         }
     }
@@ -1745,8 +1840,8 @@ impl Interpreter {
         loop {
             if self.call_stack.is_empty() {
                 println!(
-                    "Executed {} commands from function '{}'",
-                    self.commands_run, top_func,
+                    "Executed {} commands from function '{}' ({} total)",
+                    self.tick_commands_run, top_func, self.total_commands_run,
                 );
 
                 self.next_tick();
@@ -1772,8 +1867,8 @@ impl Interpreter {
 mod test {
     use super::Interpreter;
     use datapack_common::functions::{
-        command_components::{Objective, ScoreHolder},
-        Command,
+        command_components::{Objective, ScoreHolder, FunctionIdent},
+        Command, Function,
     };
 
     fn run_test(inner: &[&str]) -> i32 {
@@ -1791,14 +1886,16 @@ mod test {
             .map(|s| s.to_owned().parse::<Command>().unwrap())
             .collect();
 
-        let mut i = Interpreter::new_single_file(code);
+        let program = vec![Function { id: FunctionIdent{ path: "foo".to_string(), namespace: "bar".to_string() }, cmds: code }];
+
+        let mut i = Interpreter::new(program, 0);
 
         i.run_to_end().unwrap();
 
         let name = ScoreHolder::new("return".to_string()).unwrap();
         let obj = Objective::new("test".to_string()).unwrap();
 
-        i.scoreboard.get(&name, &obj).unwrap()
+        i.get_named_score(&name, &obj).unwrap()
     }
 
     fn cond_test(inner: &[&str], expected: i32) {

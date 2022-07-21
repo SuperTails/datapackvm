@@ -1,5 +1,7 @@
 pub mod interpreter;
 
+mod parsed;
+
 pub use interpreter::Interpreter;
 
 /*pub fn run_program(funcs: Vec<Function>, start_func: &str) -> Vec<String> {
