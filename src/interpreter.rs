@@ -1,9 +1,7 @@
-use datapack_common::functions::command::data_modify_kinds::SetFrom;
 use datapack_common::functions::command::execute_sub_commands::*;
 use datapack_common::functions::command::*;
 use datapack_common::functions::command::commands::*;
 use datapack_common::functions::command_components::*;
-use datapack_common::functions::raw_text::TextComponent;
 use datapack_common::functions::*;
 use std::borrow::Borrow;
 use std::cmp;
@@ -326,6 +324,17 @@ impl NbtStorage {
         }
     }
 
+    pub fn append(&mut self, storage_id: StorageId, path: &NbtPath, value: SNbt) {
+        let tag = self.0.entry(storage_id).or_default();
+
+        let tag = get_nbt_from_compound_mut(tag, &path.0);
+        if let SNbt::List(tag) = tag {
+            tag.0.push(value);
+        } else {
+            panic!("attempt to append to non-list tag");
+        }
+    }
+
     pub fn get(&self, storage_id: &StorageId, path: &NbtPath) -> &SNbt {
         let tag = self.0.get(storage_id).unwrap();
 
@@ -540,6 +549,8 @@ impl Scoreboard {
     }
 }
 
+type SetblockCallback = dyn for<'a> FnMut(Option<Block>, Option<&'a Block>, i32, i32, i32) + Send;
+
 pub struct Interpreter {
     pub program: Vec<ParsedFunction>,
     pub score_arena: ScoreArena,
@@ -549,6 +560,9 @@ pub struct Interpreter {
     pub scoreboard: Scoreboard,
 
     pub nbt_storage: NbtStorage,
+
+    /// Called whenever a block is changed (but ignores changes to block NBT data).
+    pub setblock_callback: Option<Box<SetblockCallback>>,
 
     func_ids: Vec<Function>,
 
@@ -638,6 +652,8 @@ impl Interpreter {
             max_total_commands: 60_000_000,
             max_tick_commands: 5_000_000,
 
+            setblock_callback: None,
+
             tick: 0,
             output: Vec::new(),
         }
@@ -717,11 +733,10 @@ impl Interpreter {
         }
     }
 
-    fn eval_message(&self, msg: &[TextComponent]) -> Result<String, InterpError> {
+    fn eval_message(&self, msg: &JsonText) -> Result<String, InterpError> {
         // TODO: ugly error handling hack
         let mut undef_var = None;
 
-        let mut result = String::new();
         let mut score_getter =
             |name: &ScoreHolder, obj: &Objective| -> Option<i32> {
                 let id = self.score_arena.get(name.clone(), obj.clone());
@@ -731,10 +746,13 @@ impl Interpreter {
                 }
                 Some(value.unwrap_or(0))
             };
-
-        for s in msg.iter().map(|m| m.as_string(&mut score_getter).unwrap()) {
-            result.push_str(&s);
-        }
+        
+        let mut storage_nbt_getter = 
+            |name: &StorageId, path: &NbtPath| -> Option<SNbt> {
+                Some(self.nbt_storage.get(name, path).clone())
+            };
+        
+        let result = msg.as_string(&mut score_getter, &mut storage_nbt_getter).unwrap();
 
         if let Some(undef_var) = undef_var {
             Err(undef_var)
@@ -796,22 +814,20 @@ impl Interpreter {
         }
     }
 
-    fn set_block(&mut self, pos: (i32, i32, i32), block: &BlockSpec, mode: SetBlockKind) {
-        use datapack_common::functions::command::commands::FuncCall;
+    fn do_setblock_callback(&mut self, old_block: Option<Block>, x: i32, y: i32, z: i32) {
+        let new_block = self.blocks.get(&(x, y, z));
+        if let Some(setblock_callback) = &mut self.setblock_callback {
+            setblock_callback(old_block, new_block, x, y, z)
+        }
+    }
 
-        if block.id.as_ref() == "minecraft:air" {
-            self.blocks.remove(&pos);
-        } else {
-            //println!("{:?}", pos);
-
-            let block = Block::try_from(block).unwrap();
-
+    fn set_block_clone(&mut self, pos: (i32, i32, i32), block: Option<Block>, mode: SetBlockKind) {
+        if let Some(block) = block {
             if block == Block::Redstone
                 && (self.blocks.get(&pos) != Some(&Block::Redstone)
                     || mode == SetBlockKind::Destroy)
             {
                 let cmd = (pos.0, pos.1 - 1, pos.2);
-                println!("Checking for command block at {:?}", cmd);
                 let b = self.blocks.get(&cmd);
                 if let Some(Block::Command(CommandBlock {
                     kind: CmdBlockKind::Impulse,
@@ -832,7 +848,22 @@ impl Interpreter {
                 }
             }
 
-            self.blocks.insert(pos, block);
+            let old_block = self.blocks.insert(pos, block);
+            self.do_setblock_callback(old_block, pos.0, pos.1, pos.2);
+        } else {
+            let old_block = self.blocks.remove(&pos);
+            self.do_setblock_callback(old_block, pos.0, pos.1, pos.2);
+        }
+    }
+
+    fn set_block(&mut self, pos: (i32, i32, i32), block: &BlockSpec, mode: SetBlockKind) {
+        if block.id.as_ref() == "minecraft:air" {
+            self.set_block_clone(pos, None, mode);
+        } else {
+            //println!("{:?}", pos);
+            let block = Block::try_from(block).unwrap();
+
+            self.set_block_clone(pos, Some(block), mode);
         }
     }
 
@@ -858,8 +889,6 @@ impl Interpreter {
 
     /// returns true if execution should continue
     fn trigger_at(&mut self, pos: (i32, i32, i32)) -> bool {
-        use datapack_common::functions::command::commands::FuncCall;
-
         if let Some(Block::Command(CommandBlock {
             kind: CmdBlockKind::Chain,
             command,
@@ -1023,6 +1052,18 @@ impl Interpreter {
         path: &NbtPath,
         value: i32,
     ) -> Result<(), InterpError> {
+        let mut addr = 4449768 / 4;
+        let z = addr % 32;
+        addr /= 32;
+        let y = addr % 256;
+        addr /= 256;
+        let x = addr;
+
+        if pos == (x, y, z) && value == 0 {
+            return Err(InterpError::BreakpointHit);
+        }
+
+
         match self.blocks.get_mut(&pos) {
             Some(Block::Jukebox(v)) => {
                 let path = path.to_string();
@@ -1258,9 +1299,7 @@ impl Interpreter {
     }
 
     pub fn execute_cmd(&mut self, cmd: &Command) -> Result<ExecResult, InterpError> {
-        let func_ids = self.program.iter().map(|f| Function { id: f.id.clone(), cmds: Vec::new() }).collect::<Vec<_>>();
-
-        let cmd = ParsedCommand::parse(cmd.clone(), &mut self.score_arena, &func_ids);
+        let cmd = ParsedCommand::parse(cmd.clone(), &mut self.score_arena, &self.func_ids);
 
         let mut ctx = Context::default();
 
@@ -1433,7 +1472,7 @@ impl Interpreter {
 
                 Ok(ExecResult::Unknown)
             }
-            ParsedCommand::Clone(Clone { start, end, dest }) => {
+            ParsedCommand::Clone(Clone { start, end, dest, filter }) => {
                 let start = maybe_based(start, ctx.pos);
                 let end = maybe_based(end, ctx.pos);
                 let dest = maybe_based(dest, ctx.pos);
@@ -1447,12 +1486,9 @@ impl Interpreter {
                                     && (start.2..=end.2).contains(&dz))
                             );
 
-                            // TODO: This should use the set_block function
                             let block = self.blocks.get(&(sx, sy, sz)).cloned();
-                            if let Some(block) = block {
-                                self.blocks.insert((dx, dy, dz), block);
-                            } else {
-                                self.blocks.remove(&(dx, dy, dz));
+                            if *filter == CloneFilterKind::Replace || block.is_some() {
+                                self.set_block_clone((dx, dy, dz), block, SetBlockKind::Replace);
                             }
                         }
                     }
@@ -1523,8 +1559,8 @@ impl Interpreter {
                 }
             }
             ParsedCommand::DataModify(DataModify { target, path, kind }) => {
-                use datapack_common::functions::command::data_modify_kinds::Set;
-
+                use datapack_common::functions::command::data_modify_kinds::{Set, SetFrom, Append};
+    
                 match target {
                     DataTarget::Block(block) => {
                         let pos = maybe_based(block, ctx.pos);
@@ -1556,6 +1592,10 @@ impl Interpreter {
                                 self.nbt_storage.set(storage_id.clone(), path, value);
                                 Ok(ExecResult::Unknown)
                             }
+                            DataModifyKind::Append(Append { value }) => {
+                                self.nbt_storage.append(storage_id.clone(), path, value.clone());
+                                Ok(ExecResult::Unknown)
+                            }
                             k => todo!("{:?}", k),
                         }
                     }
@@ -1578,16 +1618,13 @@ impl Interpreter {
 
                 Ok(ExecResult::Succeeded(result))
             }
-            ParsedCommand::Tellraw(Tellraw {
-                message,
-                target: _target,
-            }) => {
-                let msg = self.eval_message(&message.components)?;
-                /*if msg == "Printed 222" {
-                    return Err(InterpError::BreakpointHit)
-                }*/
-                println!("\n{}\n", msg);
+            ParsedCommand::Tellraw(Tellraw { message, target: _target }) => {
+                let msg = self.eval_message(message)?;
+                //if !msg.starts_with("Printed") {
+                println!("{}", msg);
+                //}
                 self.output.push(msg);
+
 
                 Ok(ExecResult::Unknown)
             }
@@ -1619,11 +1656,7 @@ impl Interpreter {
 
                     if let PExecuteSubCmd::IfScoreMatches(p_cond) = p_cond {
                         if !self.check_if_score_matches(&p_cond) {
-                            eprintln!("Currently at:");
-                            for (f, c) in self.call_stack.iter() {
-                                eprintln!("{}, {}", self.program[*f].id, c);
-                            }
-                            println!("{}", cond);
+                            eprintln!("{:?}", p_cond);
                             return Err(InterpError::AssertionFailed);
                         }
                     } else {
@@ -1723,19 +1756,17 @@ impl Interpreter {
             }
 
             ParsedCommand::Schedule(schedule) => {
-                println!("Scheduling {:?}", schedule.id);
-
                 let time = self.tick + schedule.delay as u32;
                 if schedule.replace {
-                    self.schedule.schedule_replace(time, schedule.id.clone());
+                    self.schedule.schedule_replace(time, schedule.id);
                 } else {
-                    self.schedule.schedule_append(time, schedule.id.clone());
+                    self.schedule.schedule_append(time, schedule.id);
                 }
 
                 Ok(ExecResult::Unknown)
             }
 
-            cmd => todo!(),
+            _cmd => todo!(),
         }
     }
 
@@ -1759,6 +1790,7 @@ impl Interpreter {
         if self.total_commands_run >= self.max_total_commands {
             return Err(InterpError::MaxTotalCommandsRun);
         }
+
         if self.tick_commands_run >= self.max_tick_commands {
             return Err(InterpError::MaxTickCommandsRun);
         }
@@ -1803,6 +1835,7 @@ impl Interpreter {
 
         self.tick_commands_run = 0;
 
+
         self.ctx_pos = None;
 
         if let Some(n) = self.next_pos.take() {
@@ -1835,10 +1868,10 @@ impl Interpreter {
 
         loop {
             if self.call_stack.is_empty() {
-                println!(
+                /*println!(
                     "Executed {} commands from function '{}' ({} total)",
                     self.tick_commands_run, top_func, self.total_commands_run,
-                );
+                );*/
 
                 self.next_tick();
                 break;

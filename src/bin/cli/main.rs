@@ -43,6 +43,11 @@ fn run(path: &Path) {
 			} else {
 				println!("couldn't find function {:?}", func);
 			}
+		} else if let Some(amt) = input.strip_prefix("set max_total_commands ") {
+			let amt = amt.parse::<u64>().unwrap();
+
+			interp.max_total_commands = amt;
+			println!("set max total commands to {}", amt);
 		} else if input == "run" {
 			match interp.run_to_end() {
 				Ok(()) => println!("ran successfully"),

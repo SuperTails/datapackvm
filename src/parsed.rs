@@ -69,7 +69,7 @@ pub struct PExecuteRun {
 	pub command: Option<Box<ParsedCommand>>,
 }
 
-#[derive(std::clone::Clone)]
+#[derive(std::clone::Clone, Debug)]
 pub struct PIfScoreMatches {
 	pub is_unless: bool,
 	pub target: ScoreId,
