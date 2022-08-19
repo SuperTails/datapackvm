@@ -78,6 +78,7 @@ pub enum InterpError {
     MultiBranch(FunctionIdent, Option<FunctionIdent>),
     NoBlockData(i32, i32, i32, String),
     UndefinedVar(ScoreHolder, Objective),
+    NbtError(NbtError),
 }
 
 impl std::fmt::Display for InterpError {
@@ -113,11 +114,18 @@ impl std::fmt::Display for InterpError {
             InterpError::UndefinedVar(holder, obj) => {
                 write!(f, "undefined variable {:?} {:?}", holder, obj)
             }
+            InterpError::NbtError(err) => err.fmt(f),
         }
     }
 }
 
 impl std::error::Error for InterpError {}
+
+impl From<NbtError> for InterpError {
+    fn from(n: NbtError) -> Self {
+        InterpError::NbtError(n)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum BreakKind {
@@ -185,7 +193,7 @@ impl TryFrom<&BlockSpec> for Block {
                     NbtPathPart { name: NbtPathName("Memory".to_string()), indices: Vec::new() },
                 ];
 
-                let memory = get_nbt_from_compound(&block.nbt, &path);
+                let memory = get_nbt_from_compound(&block.nbt, &path).map_err(|e| e.to_string())?;
                 let memory = if let SNbt::Integer(m) = memory {
                     *m
                 } else {
@@ -296,11 +304,30 @@ impl ExecResult {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum NbtError {
+    NoSuchChild(String),
+    IndexOutOfBounds { index: usize, length: usize },
+    Other(String),
+}
+
+impl std::fmt::Display for NbtError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NbtError::NoSuchChild(name) => write!(f, "compound tag does not have child {}", name),
+            NbtError::IndexOutOfBounds { index, length } => write!(f, "out of bounds index {} (length is {})", index, length),
+            NbtError::Other(s) => s.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for NbtError {}
+
 #[derive(Default, Debug)]
 pub struct NbtStorage(pub HashMap<StorageId, SNbtCompound>);
 
 impl NbtStorage {
-    pub fn set(&mut self, storage_id: StorageId, path: &NbtPath, value: SNbt) {
+    pub fn set(&mut self, storage_id: StorageId, path: &NbtPath, value: SNbt) -> Result<(), NbtError> {
         let tag = self.0.entry(storage_id).or_default();
 
         if path.0.last().unwrap().indices.is_empty() {
@@ -309,33 +336,37 @@ impl NbtStorage {
 
             if start.is_empty() {
                 tag.0.insert(SNbtString(end.name.0.clone()), value);
+                Ok(())
             } else {
-                let tag = get_nbt_from_compound_mut(tag, start);
+                let tag = get_nbt_from_compound_mut(tag, start)?;
                 if let SNbt::Compound(tag) = tag {
                     tag.0.insert(SNbtString(end.name.0.clone()), value);
+                    Ok(())
                 } else {
-                    panic!("attempt to insert child into non-compound tag");
+                    Err(NbtError::Other("attempt to insert child into non-compound tag".to_string()))
                 }
             }
 
         } else {
-            let tag = get_nbt_from_compound_mut(tag, &path.0);
+            let tag = get_nbt_from_compound_mut(tag, &path.0)?;
             *tag = value;
+            Ok(())
         }
     }
 
-    pub fn append(&mut self, storage_id: StorageId, path: &NbtPath, value: SNbt) {
+    pub fn append(&mut self, storage_id: StorageId, path: &NbtPath, value: SNbt) -> Result<(), NbtError> {
         let tag = self.0.entry(storage_id).or_default();
 
-        let tag = get_nbt_from_compound_mut(tag, &path.0);
+        let tag = get_nbt_from_compound_mut(tag, &path.0)?;
         if let SNbt::List(tag) = tag {
             tag.0.push(value);
+            Ok(())
         } else {
-            panic!("attempt to append to non-list tag");
+            Err(NbtError::Other("attempt to append to non-list tag".to_string()))
         }
     }
 
-    pub fn get(&self, storage_id: &StorageId, path: &NbtPath) -> &SNbt {
+    pub fn get(&self, storage_id: &StorageId, path: &NbtPath) -> Result<&SNbt, NbtError> {
         let tag = self.0.get(storage_id).unwrap();
 
         get_nbt_from_compound(tag, &path.0)
@@ -369,88 +400,89 @@ impl NbtStorage {
     }
 }
 
-pub fn get_nbt_from_compound<'a>(tag: &'a SNbtCompound, path: &[NbtPathPart]) -> &'a SNbt {
+pub fn get_nbt_from_compound<'a>(tag: &'a SNbtCompound, path: &[NbtPathPart]) -> Result<&'a SNbt, NbtError> {
     let (head, tail) = path.split_first().unwrap();
     let mut tag = tag.0.get(<_ as Borrow<str>>::borrow(&head.name)).unwrap();
     for index in head.indices.iter() {
-        tag = get_nbt_index(tag, *index);
+        tag = get_nbt_index(tag, *index)?;
     }
     get_nbt_from_tag(tag, tail)
 }
 
-pub fn get_nbt_from_compound_mut<'a>(tag: &'a mut SNbtCompound, path: &[NbtPathPart]) -> &'a mut SNbt {
+pub fn get_nbt_from_compound_mut<'a>(tag: &'a mut SNbtCompound, path: &[NbtPathPart]) -> Result<&'a mut SNbt, NbtError> {
     let (head, tail) = path.split_first().unwrap();
     let mut tag = tag.0.get_mut(<_ as Borrow<str>>::borrow(&head.name)).unwrap_or_else(|| panic!("could not get tag {:?}", head.name));
     for index in head.indices.iter() {
-        tag = get_nbt_index_mut(tag, *index);
+        tag = get_nbt_index_mut(tag, *index)?;
     }
     get_nbt_from_tag_mut(tag, tail)
 }
 
-pub fn get_nbt_child<'a>(tag: &'a SNbt, name: &NbtPathName) -> &'a SNbt {
+pub fn get_nbt_child<'a>(tag: &'a SNbt, name: &NbtPathName) -> Result<&'a SNbt, NbtError> {
     if let SNbt::Compound(tag) = tag {
-        tag.0.get(<_ as Borrow<str>>::borrow(name)).unwrap_or_else(|| panic!("could not get tag {:?}", name))
+        tag.0.get(<_ as Borrow<str>>::borrow(name)).ok_or_else(|| NbtError::NoSuchChild(name.to_string()))
     } else {
-        panic!("attempt to access child of a non-compound tag");
+        Err(NbtError::Other("attempt to access child of a non-compound tag".to_string()))
     }
 }
 
-pub fn get_nbt_child_mut<'a>(tag: &'a mut SNbt, name: &NbtPathName) -> &'a mut SNbt {
+pub fn get_nbt_child_mut<'a>(tag: &'a mut SNbt, name: &NbtPathName) -> Result<&'a mut SNbt, NbtError> {
     if let SNbt::Compound(tag) = tag {
-        tag.0.get_mut(<_ as Borrow<str>>::borrow(name)).unwrap()
+        tag.0.get_mut(<_ as Borrow<str>>::borrow(name)).ok_or_else(|| NbtError::NoSuchChild(name.to_string()))
     } else {
-        panic!("attempt to access child of a non-compound tag");
+        Err(NbtError::Other("attempt to access child of a non-compound tag".to_string()))
     }
 }
 
-pub fn get_nbt_index(tag: &SNbt, index: i32) -> &SNbt {
+pub fn get_nbt_index(tag: &SNbt, index: i32) -> Result<&SNbt, NbtError> {
     if let SNbt::List(l) = tag {
         if index < 0 {
             let offset = (-index) as usize;
             let real_index = l.0.len() - 1 - offset;
-            &l.0[real_index]
+            l.0.get(real_index).ok_or(NbtError::IndexOutOfBounds { index: real_index, length: l.0.len() })
         } else {
-            &l.0[index as usize]
+            l.0.get(index as usize).ok_or(NbtError::IndexOutOfBounds { index: index as usize, length: l.0.len() })
         }
     } else {
-        panic!("attempt to index a non-list tag");
+        Err(NbtError::Other("attempt to index a non-list tag".to_string()))
     }
 }
 
-pub fn get_nbt_index_mut(tag: &mut SNbt, index: i32) -> &mut SNbt {
+pub fn get_nbt_index_mut(tag: &mut SNbt, index: i32) -> Result<&mut SNbt, NbtError> {
     if let SNbt::List(l) = tag {
+        let length = l.0.len();
         if index < 0 {
             let offset = (-index) as usize;
             let real_index = l.0.len() - 1 - offset;
-            &mut l.0[real_index]
+            l.0.get_mut(real_index).ok_or(NbtError::IndexOutOfBounds { index: real_index, length })
         } else {
-            &mut l.0[index as usize]
+            l.0.get_mut(index as usize).ok_or(NbtError::IndexOutOfBounds { index: index as usize, length })
         }
     } else {
-        panic!("attempt to index a non-list tag");
+        Err(NbtError::Other("attempt to index a non-list tag".to_string()))
     }
 }
 
-pub fn get_nbt_from_tag<'a>(mut tag: &'a SNbt, path: &[NbtPathPart]) -> &'a SNbt {
+pub fn get_nbt_from_tag<'a>(mut tag: &'a SNbt, path: &[NbtPathPart]) -> Result<&'a SNbt, NbtError> {
     for part in path.iter() {
-        tag = get_nbt_child(tag, &part.name);
+        tag = get_nbt_child(tag, &part.name)?;
         for index in part.indices.iter() {
-            tag = get_nbt_index(tag, *index);
+            tag = get_nbt_index(tag, *index)?;
         }
     }
 
-    tag
+    Ok(tag)
 }
 
-pub fn get_nbt_from_tag_mut<'a>(mut tag: &'a mut SNbt, path: &[NbtPathPart]) -> &'a mut SNbt {
+pub fn get_nbt_from_tag_mut<'a>(mut tag: &'a mut SNbt, path: &[NbtPathPart]) -> Result<&'a mut SNbt, NbtError> {
     for part in path.iter() {
-        tag = get_nbt_child_mut(tag, &part.name);
+        tag = get_nbt_child_mut(tag, &part.name)?;
         for index in part.indices.iter() {
-            tag = get_nbt_index_mut(tag, *index);
+            tag = get_nbt_index_mut(tag, *index)?;
         }
     }
 
-    tag
+    Ok(tag)
 }
 
 #[derive(Debug)]
@@ -749,7 +781,8 @@ impl Interpreter {
         
         let mut storage_nbt_getter = 
             |name: &StorageId, path: &NbtPath| -> Option<SNbt> {
-                Some(self.nbt_storage.get(name, path).clone())
+                let n = self.nbt_storage.get(name, path).unwrap().clone();
+                Some(n)
             };
         
         let result = msg.as_string(&mut score_getter, &mut storage_nbt_getter).unwrap();
@@ -1316,7 +1349,7 @@ impl Interpreter {
             print!("({}, {}), ", self.program[*f].id, i);
         }*/
 
-        //println!("{}", cmd);
+        //println!("{:?}", cmd);
         /*if !self
             .call_stack
             .iter()
@@ -1547,7 +1580,7 @@ impl Interpreter {
                         Ok(ExecResult::Succeeded(result))
                     }
                     DataTarget::Storage(storage_id) => {
-                        let nbt = self.nbt_storage.get(storage_id, path);
+                        let nbt = self.nbt_storage.get(storage_id, path)?;
 
                         if let SNbt::Integer(result) = nbt {
                             Ok(ExecResult::Succeeded(*result))
@@ -1581,7 +1614,7 @@ impl Interpreter {
                             DataModifyKind::SetFrom(SetFrom { target, source }) => {
                                 let value = if let DataTarget::Storage(storage_id) = target {
                                     if let Some(path) = &source.0 {
-                                        self.nbt_storage.get(storage_id, path).clone()
+                                        self.nbt_storage.get(storage_id, path)?.clone()
                                     } else {
                                         todo!()
                                     }
