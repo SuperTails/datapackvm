@@ -1,6 +1,5 @@
 #[cfg(feature = "gui")]
 mod gui {
-	use pixels::Pixels;
 	use std::{io::Read, io::Write, io::BufRead, sync::Mutex, collections::HashMap};
 
 	use sdl2::audio::AudioDevice;
@@ -11,139 +10,65 @@ mod gui {
 
 	use std::path::Path;
 
-	pub struct SDLSystem {
-		pub ctx: Sdl,
-		pub video_subsystem: VideoSubsystem,
-		pub window: Window,
-	}
+	use datapack_vm::gui::Cfg;
 
-	impl SDLSystem {
-		pub fn new() -> SDLSystem {
-			let ctx = sdl2::init().unwrap();
-			let video_subsystem = ctx.video().unwrap();
-			let window = video_subsystem
-				.window("Terrible NES", 1024 + 256, 480)
-				.position_centered()
-				.build()
-				.unwrap();
-			SDLSystem {
-				ctx,
-				video_subsystem,
-				window,
-			}
-		}
-	}
-
-	impl Default for SDLSystem {
-		fn default() -> SDLSystem {
-			SDLSystem::new()
-		}
-	}
-
-	struct McState {
-		pixels: Pixels,
-	}
-
-
-	const SCREEN_WIDTH: u32 = 1024 + 256;
-	const SCREEN_HEIGHT: u32 = 480;
-
-	impl McState {
-		/*pub fn set(&mut self, block: i32) {
-			self.set_at(block, self.turtle_x, self.turtle_y, self.turtle_z);
-		}*/
-
-		pub fn set_at(&mut self, block: i32, x: i32, y: i32, z: i32) {
-			//self.blocks.insert((x, y, z), block);
-
-			if x >= 0 && y >= 0 && z == -20 {
-				let index = 4 * ((500 - x as u32) + (300 - y) as u32 * SCREEN_WIDTH);
-
-				let pixel = &mut self.pixels.get_frame()[index as usize..][..4];
-				match block {
-					0  /* Air      */ => pixel.copy_from_slice(&[0x00, 0x00, 0x00, 0xFF]),
-					1  /* Cobble   */ => pixel.copy_from_slice(&[0x64, 0x64, 0x64, 0xFF]),
-					2  /* Granite  */ => pixel.copy_from_slice(&[0x7A, 0x55, 0x48, 0xFF]),
-					3  /* Andesite */ => pixel.copy_from_slice(&[0x69, 0x69, 0x69, 0xFF]),
-					4  /* Diorite  */ => pixel.copy_from_slice(&[0x9A, 0x9A, 0x9B, 0xFF]),
-					5  /* Lapis    */ => pixel.copy_from_slice(&[0x00, 0x00, 0xFF, 0xFF]),
-					6  /* Iron     */ => pixel.copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]),
-					7  /* Gold     */ => pixel.copy_from_slice(&[0xBB, 0xA0, 0x37, 0xFF]),
-					8  /* Diamond  */ => pixel.copy_from_slice(&[0x5A, 0xB1, 0xCA, 0xFF]),
-					9  /* Redstone */ => pixel.copy_from_slice(&[0xFF, 0x00, 0x00, 0xFF]),
-					10 /* Emerald  */ => pixel.copy_from_slice(&[0x00, 0xFF, 0x00, 0xFF]),
-					11 /* Dirt     */ => pixel.copy_from_slice(&[0x69, 0x2D, 0x00, 0xFF]),
-					12 /* Oak Log  */ => pixel.copy_from_slice(&[0x5D, 0x49, 0x2B, 0xFF]),
-					13 /* Oak Leaf */ => pixel.copy_from_slice(&[0x2F, 0x47, 0x20, 0xFF]),
-					14 /* Coal     */ => pixel.copy_from_slice(&[0x0D, 0x0D, 0x0D, 0xFF]),
-					_ => pixel.copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]),
-				}
-			}
-
-			if block == 9 && x == 129 && y == 1 {
-				self.pixels.render().unwrap();
-				std::thread::sleep(std::time::Duration::from_millis(100));
-			}
-		}
-	}
+	use command_parser::CommandParse;
 
 	pub fn main() {
 		let args = std::env::args().skip(1).collect::<Vec<String>>();
 
 		match &args[..] {
-			[] => eprintln!("not enough arguments"),
-			[path] => {
-				run(Path::new(&path));
+			[] => {
+				eprintln!("not enough arguments!");
+				datapack_vm::gui::print_usage();
+				std::process::exit(1);
 			}
-			_ => eprintln!("too many arguments"),
+			[flags@.., path] => {
+				let cfg = match Cfg::new(flags) {
+					Ok(cfg) => cfg,
+					Err(()) => {
+						eprintln!("invalid arguments!");
+						datapack_vm::gui::print_usage();
+						std::process::exit(1);
+					}
+				};
+
+				run(cfg, Path::new(path));
+			}
 		}
 	}
 
-	pub fn run(path: &Path) {
+	pub fn run(vm_cfg: Cfg, path: &Path) {
 		let dir = datapack_common::vfs::Directory::open(path).unwrap();
-		let datapack = datapack_common::Datapack::from_directory(&dir).unwrap();
+		let datapack = datapack_common::Datapack::from_directory(&dir).unwrap().functions;
 
-		let sdl_system = SDLSystem::new();
-		let pixels = Pixels::new(SCREEN_WIDTH, SCREEN_HEIGHT, pixels::SurfaceTexture::new(SCREEN_WIDTH, SCREEN_HEIGHT, &sdl_system.window)).unwrap();
+		let indiv_time = vec![0; datapack.len()];
+		let intrin_cum_times = vec![0; datapack.len()];
+		let intrin_visited = vec![false; datapack.len()];
+		let intrin_funcs = datapack.iter().map(|func| func.id.namespace == "intrinsic").collect::<Vec<_>>();
 
-		let state = Mutex::new(McState { pixels });
-		let state = Box::leak(Box::new(state));
+		let mut interp = datapack_vm::Interpreter::new(datapack, 0);
 
-		let handle = std::thread::spawn(|| {
-			let mut interp = datapack_vm::Interpreter::new(datapack.functions, 0);
+		interp.max_total_commands = 1_500_000_000;
+		interp.max_tick_commands = 60_000_000;
 
-			use interpreter::Block;
+		let (sdl, state) = datapack_vm::gui::setup(&mut interp, vm_cfg);
 
-			let setblock_callback = |_old_block: Option<interpreter::Block>, new_block: Option<&Block>, x: i32, y: i32, z: i32| {
-				let block_idx = match new_block {
-					None => 0, /* Air */
-					Some(Block::Other(id)) if id == "minecraft:cobblestone" => 1, /* Cobblestone */
-					Some(Block::Other(id)) if id == "minecraft:granite" => 2,
-					Some(Block::Other(id)) if id == "minecraft:andesite" => 3,
-					Some(Block::Other(id)) if id == "minecraft:diorite" => 4,
-					Some(Block::Other(id)) if id == "minecraft:lapis_block" => 5,
-					Some(Block::Other(id)) if id == "minecraft:iron_block" => 6,
-					Some(Block::Other(id)) if id == "minecraft:gold_block" => 7,
-					Some(Block::Other(id)) if id == "minecraft:diamond_block" => 8,
-					Some(Block::Redstone) => 9, /* Redstone */
-					Some(Block::Other(id)) if id == "minecraft:emerald_block" => 10,
-					Some(Block::Other(id)) if id == "minecraft:dirt" => 11,
-					Some(Block::Other(id)) if id == "minecraft:green_wool" => 13,
-					Some(Block::Other(id)) if id == "minecraft:coal_block" => 14,
+		let (_, func_name) = datapack_common::functions::command_components::FunctionIdent::parse_from_command("wasmrunner:init").unwrap();
 
-					Some(Block::Jukebox(_)) => return,
-					Some(Block::Command(_)) => return,
+		let interp_idx = interp.get_func_idx(&func_name);
+		interp.set_pos(interp_idx);
 
-					_ => { println!("unknown block {:?}", new_block); return },
-				};
+		interp.run_to_end().unwrap();
 
-				let mut s = state.lock().unwrap();
+		interp.max_tick_commands = 500_000;
 
-				s.set_at(block_idx, x, y, z);
-			};
+		let (_, func_name) = datapack_common::functions::command_components::FunctionIdent::parse_from_command("wasmrunner:_start").unwrap();
 
-			interp.setblock_callback = Some(Box::new(setblock_callback));
+		let interp_idx = interp.get_func_idx(&func_name);
+		interp.set_pos(interp_idx);
 
+		std::thread::spawn(move || {
 			let mut stdout = std::io::stdout();
 
 			let stdin = std::io::stdin();
@@ -185,28 +110,7 @@ mod gui {
 			}
 		});
 
-		let mut event_pump = sdl_system.ctx.event_pump().unwrap();
-
-		loop {
-
-			for event in event_pump.poll_iter() {
-				match event {
-					sdl2::event::Event::Quit { .. }
-					| sdl2::event::Event::KeyDown {
-						keycode: Some(sdl2::keyboard::Keycode::Escape),
-						..
-					} => {
-						std::process::exit(0);
-					}
-					_ => {}
-				}
-			}
-
-			std::thread::sleep(std::time::Duration::from_millis(16));
-
-			let l = state.lock().unwrap();
-			l.pixels.render().unwrap();
-		}
+		datapack_vm::gui::run(sdl, state);
 	}
 }
 

@@ -1,6 +1,50 @@
 use pixels::Pixels;
 use std::{io::Read, io::Write, io::BufRead, sync::Mutex, collections::HashMap};
 
+pub struct Cfg {
+    quiet_print: bool,
+    quiet_sleep: bool,
+    z_plane: i32,
+    frame_magic: i32,
+    frame_sleep: u64,
+}
+
+impl Cfg {
+    pub fn new(args: &[String]) -> Result<Self, ()> {
+        let mut result = Cfg { quiet_print: false, quiet_sleep: false, z_plane: -60, frame_magic: 0xDDDD, frame_sleep: 500, };
+
+        for flag in args {
+            if flag == "--quiet-print" {
+                result.quiet_print = true;
+            } else if flag == "--quiet-sleep" {
+                result.quiet_sleep = true;
+            } else if let Some(num) = flag.strip_prefix("--z-plane=") {
+                let num = num.parse().map_err(|_| ())?;
+                result.z_plane = num;
+            } else if let Some(num) = flag.strip_prefix("--frame-magic=") {
+                let num = num.parse().map_err(|_| ())?;
+                result.frame_magic = num;
+            } else if let Some(num) = flag.strip_prefix("--frame-sleep=") {
+                let num = num.parse().map_err(|_| ())?;
+                result.frame_sleep = num;
+            } else {
+                return Err(());
+            }
+        }
+
+        Ok(result)
+    }
+}
+
+pub fn print_usage() {
+    eprintln!("GUI Simulator Flags:");
+    eprintln!("--quiet-print       Disables output from `print()` calls");
+    eprintln!("--quiet-sleep       Disables printing a message for `mc_sleep()` calls");
+    eprintln!("--frame-magic=NUM   Sets the magic argument to `print()` that indicates a frame has completed");
+    eprintln!("--frame-sleep=NUM   Specifies how many milliseconds to sleep after a frame finishes (defaults to 500)");
+    eprintln!("--z-plane=NUM       Sets the z coordinate that will be checked for blocks to display (defaults to -60)");
+}
+
 use sdl2::audio::AudioDevice;
 use sdl2::video::Window;
 use sdl2::{AudioSubsystem, EventPump, Sdl, VideoSubsystem};
@@ -40,6 +84,7 @@ impl Default for SDLSystem {
 
 pub struct McState {
 	pixels: Pixels,
+	cfg: Cfg,
 }
 
 
@@ -54,7 +99,7 @@ impl McState {
 	pub fn set_at(&mut self, block: i32, x: i32, y: i32, z: i32) {
 		//self.blocks.insert((x, y, z), block);
 
-		if x >= 0 && y >= 0 && z == -60 {
+		if x >= 0 && y >= 0 && z == self.cfg.z_plane {
 			let index = 4 * ((100 + x as u32) + (300 - y) as u32 * SCREEN_WIDTH);
 
 			let pixel = &mut self.pixels.get_frame()[index as usize..][..4];
@@ -77,21 +122,16 @@ impl McState {
 				_ => pixel.copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]),
 			}
 		}
-
-		if block == 9 && x == 129 && y == 1 {
-			self.pixels.render().unwrap();
-			std::thread::sleep(std::time::Duration::from_millis(100));
-		}
 	}
 }
 
-pub fn setup(interp: &mut Interpreter) -> (SDLSystem, &'static Mutex<McState>) {
+pub fn setup(interp: &mut Interpreter, cfg: Cfg) -> (SDLSystem, &'static Mutex<McState>) {
 	use crate::interpreter::Block;
 
 	let sdl_system = SDLSystem::new();
 	let pixels = Pixels::new(SCREEN_WIDTH, SCREEN_HEIGHT, pixels::SurfaceTexture::new(SCREEN_WIDTH, SCREEN_HEIGHT, &sdl_system.window)).unwrap();
 
-	let state = Mutex::new(McState { pixels });
+	let state = Mutex::new(McState { pixels, cfg });
 	let state = Box::leak(Box::new(state));
 
 	let setblock_callback = |_old_block: Option<Block>, new_block: Option<&Block>, x: i32, y: i32, z: i32| {

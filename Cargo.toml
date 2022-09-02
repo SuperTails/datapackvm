@@ -23,7 +23,7 @@ serde_with = "1.9"
 serde_json = "1.0"
 lazy_static = "1.4"
 datapack_common = { git = "https://github.com/SuperTails/datapack_common" }
-#datapack_common = { path = "../datapack_common" }
+command_parser = { git = "https://github.com/Inky-developer/command-parser" }
 
 sdl2 = { version = "0.35.0", features = ["raw-window-handle"], optional = true }
 pixels = { version = "0.9.0", optional = true }
