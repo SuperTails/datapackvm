@@ -13,17 +13,14 @@ use std::str::FromStr;
 
 use crate::parsed::*;
 
-fn get_name(target: &ScoreboardTarget) -> Option<&ScoreHolder> {
+fn target_uuid(target: &Target, ctx_uuid: Option<Uuid>) -> Uuid {
     match target {
-        ScoreboardTarget::Target(target) => get_target_name(target),
-        ScoreboardTarget::Asterisk => None,
-    }
-}
-
-fn get_target_name(target: &Target) -> Option<&ScoreHolder> {
-    match target {
-        Target::Name(name) => Some(name),
-        Target::Selector(_) => None,
+        Target::Selector(Selector {
+            var: SelectorVariable::ThisEntity,
+            ..
+        }) => ctx_uuid.unwrap(),
+        Target::Uuid(uuid) => *uuid,
+        _ => todo!(),
     }
 }
 
@@ -66,7 +63,7 @@ fn calc_coord(coord: &Coord, base: i32) -> i32 {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum InterpError {
-    OutOfBoundsEntity(String, i32, i32, i32),
+    OutOfBoundsEntity(Uuid, i32, i32, i32),
     MaxTotalCommandsRun,
     MaxTickCommandsRun,
     EnteredUnreachable,
@@ -85,7 +82,7 @@ impl std::fmt::Display for InterpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             InterpError::OutOfBoundsEntity(tag, x, y, z) => {
-                write!(f, "out of bounds entity {:?} at x={}, y={}, z={}", tag, x, y, z)
+                write!(f, "out of bounds entity {} at x={}, y={}, z={}", tag, x, y, z)
             }
             InterpError::MaxTotalCommandsRun => write!(f, "ran too many total commands"),
             InterpError::MaxTickCommandsRun => write!(f, "ran too many commands in a single tick"),
@@ -270,9 +267,9 @@ impl TryFrom<&BlockSpec> for Block {
 }
 
 #[derive(Debug, Clone, Default)]
-struct Context {
+pub struct Context {
     pub pos: Option<(i32, i32, i32)>,
-    pub ident: Option<String>,
+    pub ident: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -583,6 +580,61 @@ impl Scoreboard {
 
 type SetblockCallback = dyn for<'a> FnMut(Option<Block>, Option<&'a Block>, i32, i32, i32) + Send;
 
+type TellrawCallback = dyn for<'a> FnMut(&'a str) + Send;
+
+#[derive(Default)]
+pub struct StackFrame {
+    pub func: usize,
+    pub cmd: usize,
+    /// The context this function was invoked with
+    pub ctx: Context,
+}
+
+#[derive(Default)]
+pub struct CallStack(pub Vec<StackFrame>);
+
+impl CallStack {
+    pub fn new_at_func(func: usize) -> Self {
+        CallStack(vec![StackFrame { func, cmd: 0, ctx: Context::default() }])
+    }
+
+    pub fn push(&mut self, frame: StackFrame) {
+        self.0.push(frame)
+    }
+
+    pub fn pop(&mut self) -> Option<StackFrame> {
+        self.0.pop()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<StackFrame> {
+        self.0.iter()
+    }
+
+    pub fn first(&self) -> Option<&StackFrame> {
+        self.0.first()
+    }
+
+    pub fn first_mut(&mut self) -> Option<&mut StackFrame> {
+        self.0.first_mut()
+    }
+
+    pub fn last(&self) -> Option<&StackFrame> {
+        self.0.last()
+    }
+
+    pub fn last_mut(&mut self) -> Option<&mut StackFrame> {
+        self.0.last_mut()
+    }
+}
+
 pub struct Interpreter {
     pub program: Vec<ParsedFunction>,
     pub score_arena: ScoreArena,
@@ -596,23 +648,21 @@ pub struct Interpreter {
     /// Called whenever a block is changed (but ignores changes to block NBT data).
     pub setblock_callback: Option<Box<SetblockCallback>>,
 
+    /// Called whenever a tellraw command is executed.
+    /// If None, the tellraw message will be printed to stdout.
+    pub tellraw_callback: Option<Box<TellrawCallback>>,
+
     func_ids: Vec<Function>,
 
     schedule: Schedule,
 
-    call_stack: Vec<(usize, usize)>,
+    pub call_stack: CallStack,
+
     ctx_pos: Option<(i32, i32, i32)>,
 
     blocks: HashMap<(i32, i32, i32), Block>,
 
-    memory_ptr_pos: (i32, i32, i32),
-    local_ptr_pos: (i32, i32, i32),
-    global_ptr_pos: (i32, i32, i32),
-    frame_ptr_pos: (i32, i32, i32),
-    stack_ptr_pos: (i32, i32, i32),
-
-    turtle_pos: (i32, i32, i32),
-    next_chain_pos: (i32, i32, i32),
+    markers: HashMap<Uuid, (i32, i32, i32)>,
 
     next_pos: Option<(usize, usize, (i32, i32, i32))>,
 
@@ -634,7 +684,7 @@ pub struct Interpreter {
 
 impl Interpreter {
     pub fn set_pos(&mut self, func_idx: usize) {
-        self.call_stack = vec![(func_idx, 0)];
+        self.call_stack = CallStack::new_at_func(func_idx);
         self.ctx_pos = None;
     }
 
@@ -662,20 +712,14 @@ impl Interpreter {
             program: p_program,
             score_arena,
             ctx_pos: None,
-            call_stack: vec![(start_func_idx, 0)],
+            call_stack: CallStack::new_at_func(start_func_idx),
             schedule: Schedule::default(),
             func_ids,
             blocks: HashMap::new(),
             indiv_time: Default::default(),
-            memory_ptr_pos: Default::default(),
-            frame_ptr_pos: Default::default(),
-            local_ptr_pos: Default::default(),
-            stack_ptr_pos: Default::default(),
-            global_ptr_pos: Default::default(),
+            markers: HashMap::new(),
             scoreboard: Scoreboard::new(len),
             nbt_storage: NbtStorage::default(),
-            turtle_pos: (0, 0, 0),
-            next_chain_pos: (0, 0, 0),
             next_pos: None,
 
             total_commands_run: 0,
@@ -685,6 +729,7 @@ impl Interpreter {
             max_tick_commands: 5_000_000,
 
             setblock_callback: None,
+            tellraw_callback: None,
 
             tick: 0,
             output: Vec::new(),
@@ -710,10 +755,6 @@ impl Interpreter {
         self.call_stack.len()
     }
 
-    pub fn call_stack_raw(&self) -> &[(usize, usize)] {
-        &self.call_stack
-    }
-
     pub fn set_named_score(&mut self, holder: &ScoreHolder, obj: &Objective, value: i32) {
         let s = self.score_arena.intern(holder.clone(), obj.clone());
         self.scoreboard.set(s, value)
@@ -727,13 +768,12 @@ impl Interpreter {
     pub fn call_stack(&self) -> Vec<(&ParsedFunction, usize)> {
         self.call_stack
             .iter()
-            .copied()
-            .map(|(f, c)| (&self.program[f], c))
+            .map(|frame| (&self.program[frame.func], frame.cmd))
             .collect()
     }
 
     pub fn call_stack_top(&self) -> Option<(&ParsedFunction, usize)> {
-        self.call_stack.last().map(|(f, i)| (&self.program[*f], *i))
+        self.call_stack.last().map(|frame| (&self.program[frame.func], frame.cmd))
     }
 
     fn set_next_pos(&mut self, func_idx: usize, pos: (i32, i32, i32)) -> Result<(), InterpError> {
@@ -758,8 +798,8 @@ impl Interpreter {
 
     pub fn next_command(&self) -> Option<&ParsedCommand> {
         if !self.halted() {
-            let (func_idx, cmd_idx) = self.call_stack.last().unwrap();
-            Some(&self.program[*func_idx].cmds[*cmd_idx])
+            let frame = self.call_stack.last().unwrap();
+            Some(&self.program[frame.func].cmds[frame.cmd])
         } else {
             None
         }
@@ -900,63 +940,6 @@ impl Interpreter {
         }
     }
 
-    /// `pos` is the position of the original command block
-    /// returns true if execution should continue
-    fn trigger_chain(&mut self, pos: (i32, i32, i32)) -> bool {
-        let facing =
-            if let Some(Block::Command(CommandBlock { facing, .. })) = self.blocks.get(&pos) {
-                *facing
-            } else {
-                panic!()
-            };
-
-        let next_pos = match facing {
-            Facing::East => (pos.0 + 1, pos.1, pos.2),
-            Facing::West => (pos.0 - 1, pos.1, pos.2),
-            Facing::South => (pos.0, pos.1, pos.2 + 1),
-            Facing::North => (pos.0, pos.1, pos.2 - 1),
-        };
-
-        self.trigger_at(next_pos)
-    }
-
-    /// returns true if execution should continue
-    fn trigger_at(&mut self, pos: (i32, i32, i32)) -> bool {
-        if let Some(Block::Command(CommandBlock {
-            kind: CmdBlockKind::Chain,
-            command,
-            ..
-        })) = self.blocks.get(&pos)
-        {
-            if !command.is_empty() {
-                let c = command.parse::<Command>().unwrap();
-                let id = if let Command::FuncCall(FuncCall { id }) = c {
-                    id
-                } else {
-                    todo!("{}", c)
-                };
-
-                let idx = self.get_func_idx(&id);
-
-                assert!(self.call_stack.is_empty());
-
-                self.call_stack.push((idx, 0));
-                self.ctx_pos = Some(pos);
-
-                eprintln!(
-                    "Stackptr at beginning of {} [chained at {:?}] is {:?}",
-                    self.program[idx].id, pos, self.stack_ptr_pos
-                );
-
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        }
-    }
-
     pub fn get_block(&self, pos: (i32, i32, i32)) -> Option<&Block> {
         self.blocks.get(&pos)
     }
@@ -978,34 +961,16 @@ impl Interpreter {
 
     fn get_pos(&self, target: &Target) -> (i32, i32, i32) {
         match target {
-            Target::Selector(_) => match target.to_string().as_str() {
-                "@e[tag=memoryptr]" => self.memory_ptr_pos,
-                "@e[tag=localptr]" => self.local_ptr_pos,
-                "@e[tag=frameptr]" => self.frame_ptr_pos,
-                "@e[tag=globalptr]" => self.global_ptr_pos,
-                "@e[tag=stackptr]" => self.stack_ptr_pos,
-                "@e[tag=turtle]" => self.turtle_pos,
-                "@e[tag=nextchain]" => self.next_chain_pos,
-                t => todo!("{:?}", t),
-            },
+            Target::Uuid(uuid) => {
+                *self.markers.get(uuid).unwrap()
+            }
             _ => todo!("{:?}", target),
         }
     }
 
-    fn get_ident(&self, target: &Target) -> String {
+    fn get_ident(&self, target: &Target) -> Uuid {
         match target {
-            Target::Selector(_) => match target.to_string().as_str() {
-                "@e[tag=memoryptr]" => "memoryptr",
-                "@e[tag=localptr]" => "localptr",
-                "@e[tag=frameptr]" => "frameptr",
-                "@e[tag=globalptr]" => "globalptr",
-                "@e[tag=stackptr]" => "stackptr",
-                "@e[tag=condstackptr]" => "condstackptr",
-                "@e[tag=turtle]" => "turtle",
-                "@e[tag=nextchain]" => "nextchain",
-                t => todo!("{:?}", t),
-            }
-            .to_string(),
+            Target::Uuid(uuid) => *uuid,
             _ => todo!("{:?}", target),
         }
     }
@@ -1164,10 +1129,12 @@ impl Interpreter {
                     }
                 }
                 PExecuteSubCmd::At(At { target }) => {
-                    ctx.pos = Some(self.get_pos(target));
+                    let uuid = target_uuid(target, ctx.ident);
+                    ctx.pos = Some(*self.markers.get(&uuid).unwrap());
                 }
                 PExecuteSubCmd::As(As { target }) => {
-                    ctx.ident = Some(self.get_ident(target));
+                    let uuid = target_uuid(target, ctx.ident);
+                    ctx.ident = Some(uuid);
                 }
                 PExecuteSubCmd::StoreScore(..) | PExecuteSubCmd::StoreStorage(..) => {
                     assert!(store.is_none());
@@ -1273,24 +1240,9 @@ impl Interpreter {
                         DataTarget::Entity(target) => {
                             assert!(ty == "double");
 
-                            let target = match target {
-                                Target::Selector(Selector {
-                                    var: SelectorVariable::ThisEntity,
-                                    ..
-                                }) => ctx.ident.as_ref().unwrap(),
-                                _ => todo!("{:?}", target),
-                            };
+                            let target = target_uuid(target, ctx.ident);
 
-                            let pos = match target.as_str() {
-                                "memoryptr" => &mut self.memory_ptr_pos,
-                                "stackptr" => &mut self.stack_ptr_pos,
-                                "frameptr" => &mut self.frame_ptr_pos,
-                                "localptr" => &mut self.local_ptr_pos,
-                                "globalptr" => &mut self.global_ptr_pos,
-                                "turtle" => &mut self.turtle_pos,
-                                "nextchain" => &mut self.next_chain_pos,
-                                _ => todo!("{:?}", target),
-                            };
+                            let pos = self.markers.get_mut(&target).unwrap_or_else(|| panic!("{}", target));
 
                             let path = path.to_string();
 
@@ -1304,13 +1256,13 @@ impl Interpreter {
                             // If an entity moves too far, it will die or go outside of the loaded chunks.
                             // Either way, that means it can't be used anymore, so it's an error.
                             if !(-512..512).contains(&pos.0) {
-                                return Err(InterpError::OutOfBoundsEntity(target.clone(), pos.0, pos.1, pos.2));
+                                return Err(InterpError::OutOfBoundsEntity(target, pos.0, pos.1, pos.2));
                             }
                             if !(-64..256).contains(&pos.1) {
-                                return Err(InterpError::OutOfBoundsEntity(target.clone(), pos.0, pos.1, pos.2));
+                                return Err(InterpError::OutOfBoundsEntity(target, pos.0, pos.1, pos.2));
                             }
                             if !(-512..512).contains(&pos.2) {
-                                return Err(InterpError::OutOfBoundsEntity(target.clone(), pos.0, pos.1, pos.2));
+                                return Err(InterpError::OutOfBoundsEntity(target, pos.0, pos.1, pos.2));
                             }
 
                             Ok(ExecResult::Unknown)
@@ -1318,7 +1270,7 @@ impl Interpreter {
                         DataTarget::Storage(storage_id) => {
                             assert!(ty == "int");
 
-                            self.nbt_storage.set(storage_id.clone(), path, SNbt::Integer(value));
+                            self.nbt_storage.set(storage_id.clone(), path, SNbt::Integer(value)).unwrap();
 
                             Ok(ExecResult::Unknown)
                         }
@@ -1498,7 +1450,7 @@ impl Interpreter {
                     .0;
                 self.call_stack.push((called_idx, 0));*/
 
-                self.call_stack.push((called_idx, 0));
+                self.call_stack.push(StackFrame { func: called_idx, cmd: 0, ctx: ctx.clone() });
 
                 //eprintln!("called {}", id);
                 //}
@@ -1608,7 +1560,7 @@ impl Interpreter {
                     DataTarget::Storage(storage_id) => {
                         match kind {
                             DataModifyKind::Set(Set { value }) => {
-                                self.nbt_storage.set(storage_id.clone(), path, value.clone());
+                                self.nbt_storage.set(storage_id.clone(), path, value.clone()).unwrap();
                                 Ok(ExecResult::Unknown)
                             }
                             DataModifyKind::SetFrom(SetFrom { target, source }) => {
@@ -1622,11 +1574,11 @@ impl Interpreter {
                                     todo!("{:?}", target);
                                 };
 
-                                self.nbt_storage.set(storage_id.clone(), path, value);
+                                self.nbt_storage.set(storage_id.clone(), path, value).unwrap();
                                 Ok(ExecResult::Unknown)
                             }
                             DataModifyKind::Append(Append { value }) => {
-                                self.nbt_storage.append(storage_id.clone(), path, value.clone());
+                                self.nbt_storage.append(storage_id.clone(), path, value.clone()).unwrap();
                                 Ok(ExecResult::Unknown)
                             }
                             k => todo!("{:?}", k),
@@ -1653,9 +1605,12 @@ impl Interpreter {
             }
             ParsedCommand::Tellraw(Tellraw { message, target: _target }) => {
                 let msg = self.eval_message(message)?;
-                //if !msg.starts_with("Printed") {
-                println!("{}", msg);
-                //}
+
+                if let Some(callback) = self.tellraw_callback.as_mut() {
+                    callback(&msg);
+                } else {
+                    println!("{}", msg);
+                }
                 self.output.push(msg);
 
 
@@ -1713,34 +1668,13 @@ impl Interpreter {
                     .as_ref()
                     .map_or((0, 0, 0), |pos| maybe_based(pos, ctx.pos));
 
-                if entity == "minecraft:armor_stand" {
+                if entity == "minecraft:marker" {
                     if let Some(data) = &data.0 {
-                        let data = data.to_string();
+                        let uuid: Uuid = data.0.get("UUID").unwrap().clone().try_into().unwrap();
 
-                        if data.contains("frameptr") {
-                            self.frame_ptr_pos = pos;
-                            Ok(ExecResult::Unknown)
-                        } else if data.contains("stackptr") {
-                            self.stack_ptr_pos = pos;
-                            Ok(ExecResult::Unknown)
-                        } else if data.contains("globalptr") {
-                            self.global_ptr_pos = pos;
-                            Ok(ExecResult::Unknown)
-                        } else if data.contains("localptr") {
-                            self.local_ptr_pos = pos;
-                            Ok(ExecResult::Unknown)
-                        } else if data.contains("memoryptr") {
-                            self.memory_ptr_pos = pos;
-                            Ok(ExecResult::Unknown)
-                        } else if data.contains("turtle") {
-                            self.turtle_pos = pos;
-                            Ok(ExecResult::Unknown)
-                        } else if data.contains("nextchain") {
-                            self.next_chain_pos = pos;
-                            Ok(ExecResult::Unknown)
-                        } else {
-                            todo!()
-                        }
+                        self.markers.insert(uuid, pos);
+
+                        Ok(ExecResult::Unknown)
                     } else {
                         todo!()
                     }
@@ -1775,15 +1709,7 @@ impl Interpreter {
 
                 let pos = maybe_based(pos, ctx.pos);
 
-                match target.as_str() {
-                    "stackptr" => self.stack_ptr_pos = pos,
-                    "memoryptr" => self.memory_ptr_pos = pos,
-                    "localptr" => self.local_ptr_pos = pos,
-                    "globalptr" => self.global_ptr_pos = pos,
-                    "frameptr" => self.frame_ptr_pos = pos,
-                    "nextchain" => self.next_chain_pos = pos,
-                    _ => todo!("{:?}", target),
-                };
+                *self.markers.get_mut(target).unwrap() = pos;
 
                 Ok(ExecResult::Unknown)
             }
@@ -1804,17 +1730,17 @@ impl Interpreter {
     }
 
     pub fn get_top_func(&self) -> String {
-        let (top_func_idx, _) = self.call_stack.first().unwrap();
-        self.program[*top_func_idx].id.to_string()
+        let top_func_idx = self.call_stack.first().unwrap().func;
+        self.program[top_func_idx].id.to_string()
     }
 
     fn update_time_traces(&mut self) {
-        let (current_func, _) = self.call_stack.last_mut().unwrap();
+        let current_func = self.call_stack.last_mut().unwrap().func;
 
-        if let Some(cnt) = self.indiv_time.get_mut(&self.program[*current_func].id) {
+        if let Some(cnt) = self.indiv_time.get_mut(&self.program[current_func].id) {
             *cnt += 1;
         } else {
-            self.indiv_time.insert(self.program[*current_func].id.clone(), 1);
+            self.indiv_time.insert(self.program[current_func].id.clone(), 1);
         }
     }
 
@@ -1828,22 +1754,21 @@ impl Interpreter {
             return Err(InterpError::MaxTickCommandsRun);
         }
 
-        let (top_func_idx, _) = self.call_stack.first().unwrap();
-        let top_func = self.program[*top_func_idx].id.to_string();
+        let top_func_idx = self.call_stack.first().unwrap().func;
+        let top_func = self.program[top_func_idx].id.to_string();
 
         self.update_time_traces();
 
-        let (func_idx, cmd_idx) = self.call_stack.last_mut().unwrap();
+        let frame = self.call_stack.last_mut().unwrap();
 
         //println!("Function {} at command {}", self.program[*func_idx].id, cmd_idx);
 
-        let cmd = &self.program[*func_idx].cmds[*cmd_idx].clone();
-        *cmd_idx += 1;
+        let cmd = &self.program[frame.func].cmds[frame.cmd].clone();
+        frame.cmd += 1;
 
-        let mut ctx = Context {
-            pos: self.ctx_pos,
-            ident: None,
-        };
+        assert!(self.ctx_pos.is_none());
+
+        let mut ctx = frame.ctx.clone();
 
         // TODO: This doesn't get incremented on breakpoints
         self.total_commands_run += 1;
@@ -1861,27 +1786,23 @@ impl Interpreter {
 
         if let Some(ctx_pos) = self.ctx_pos {
             println!("Pos was {:?}", ctx_pos);
-            if self.trigger_chain(ctx_pos) {
+            todo!();
+            /*if self.trigger_chain(ctx_pos) {
                 assert!(self.schedule.get_next(self.tick).is_none());
-            }
+            }*/
         }
 
         self.tick_commands_run = 0;
 
-
         self.ctx_pos = None;
 
         if let Some(n) = self.next_pos.take() {
-            eprintln!("\nNow about to execute {}", &self.program[n.0].id);
+            todo!()
+            /*eprintln!("\nNow about to execute {}", &self.program[n.0].id);
             self.call_stack.push((n.0, n.1));
             self.ctx_pos = Some(n.2);
 
-            assert!(self.schedule.get_next(self.tick).is_none());
-
-            eprintln!(
-                "Stackptr at beginning of {} is {:?}",
-                self.program[n.0].id, self.stack_ptr_pos
-            );
+            assert!(self.schedule.get_next(self.tick).is_none());*/
         }
 
         if let Some(next_tick) = self.schedule.next_tick() {
@@ -1890,7 +1811,7 @@ impl Interpreter {
 
             let (_, next) = self.schedule.get_next(self.tick).unwrap();
             
-            self.call_stack.push((next, 0));
+            self.call_stack.push(StackFrame { func: next, cmd: 0, ctx: Context::default() });
             self.ctx_pos = None;
         }
     }
@@ -1910,9 +1831,9 @@ impl Interpreter {
                 break;
             }
 
-            let (func_idx, cmd_idx) = self.call_stack.last().unwrap();
+            let frame = self.call_stack.last().unwrap();
 
-            if self.program[*func_idx].cmds.len() == *cmd_idx {
+            if self.program[frame.func].cmds.len() == frame.cmd {
                 self.call_stack.pop();
             } else {
                 return;
@@ -2053,3 +1974,5 @@ mod test {
 
     // TODO: More
 }
+
+// TODO: Test that context applies to called functions

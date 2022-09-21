@@ -64,7 +64,7 @@ impl ScoreArena {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ScoreId(pub usize);
 
-#[derive(std::clone::Clone)]
+#[derive(std::clone::Clone, Debug)]
 pub struct PExecuteRun {
 	pub command: Option<Box<ParsedCommand>>,
 }
@@ -76,7 +76,7 @@ pub struct PIfScoreMatches {
 	pub range: MinecraftRange,
 }
 
-#[derive(std::clone::Clone)]
+#[derive(std::clone::Clone, Debug)]
 pub struct PIfScoreRelation {
 	pub is_unless: bool,
 	pub target: ScoreId,
@@ -84,13 +84,13 @@ pub struct PIfScoreRelation {
 	pub source: ScoreId,
 }
 
-#[derive(std::clone::Clone)]
+#[derive(std::clone::Clone, Debug)]
 pub struct PStoreScore {
 	pub is_success: bool,
 	pub target: ScoreId,
 }
 
-#[derive(std::clone::Clone)]
+#[derive(std::clone::Clone, Debug)]
 pub enum PExecuteSubCmd {
 	IfScoreMatches(PIfScoreMatches),
 	IfScoreRelation(PIfScoreRelation),
@@ -136,45 +136,45 @@ impl PExecuteSubCmd {
 	}
 }
 
-#[derive(std::clone::Clone)]
+#[derive(std::clone::Clone, Debug)]
 pub struct PExecute {
 	pub subcommands: Vec<PExecuteSubCmd>,
 	pub run: Option<Box<ParsedCommand>>,
 }
 
-#[derive(std::clone::Clone)]
+#[derive(std::clone::Clone, Debug)]
 pub struct PScoreAdd {
 	pub target: ScoreId,
 	pub remove: bool,
 	pub score: i32,
 }
 
-#[derive(std::clone::Clone)]
+#[derive(std::clone::Clone, Debug)]
 pub struct PScoreGet {
 	pub target: ScoreId,
 }
 
-#[derive(std::clone::Clone)]
+#[derive(std::clone::Clone, Debug)]
 pub struct PScoreOp {
 	pub target: ScoreId,
 	pub op: ScoreOpKind,
 	pub source: ScoreId,
 }
 
-#[derive(std::clone::Clone)]
+#[derive(std::clone::Clone, Debug)]
 pub struct PScoreSet {
 	pub target: ScoreId,
 	pub score: i32,
 }
 
-#[derive(std::clone::Clone)]
+#[derive(std::clone::Clone, Debug)]
 pub struct PSchedule {
 	pub id: usize,
 	pub delay: i32,
 	pub replace: bool,
 }
 
-#[derive(std::clone::Clone)]
+#[derive(std::clone::Clone, Debug)]
 pub enum ParsedCommand {
 	Clone(Clone),
 	Comment(Comment),
