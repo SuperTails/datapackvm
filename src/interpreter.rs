@@ -1268,9 +1268,14 @@ impl Interpreter {
                             Ok(ExecResult::Unknown)
                         }
                         DataTarget::Storage(storage_id) => {
-                            assert!(ty == "int");
+                            let value = match ty.as_str() {
+                                "int" => SNbt::Integer(value),
+                                "float" => SNbt::Float(NotNan::new(value as f32).unwrap()),
+                                "double" => SNbt::Double(NotNan::new(value as f64).unwrap()),
+                                ty => todo!("{:?}", ty),
+                            };
 
-                            self.nbt_storage.set(storage_id.clone(), path, SNbt::Integer(value)).unwrap();
+                            self.nbt_storage.set(storage_id.clone(), path, value).unwrap();
 
                             Ok(ExecResult::Unknown)
                         }
@@ -1584,7 +1589,48 @@ impl Interpreter {
                             k => todo!("{:?}", k),
                         }
                     }
-                    _ => todo!(),
+                    DataTarget::Entity(target) => {
+                        let target = target_uuid(target, ctx.ident);
+
+                        let pos = self.markers.get_mut(&target).unwrap_or_else(|| panic!("{}", target));
+
+                        let path = path.to_string();
+
+                        assert_eq!(path, "Pos");
+
+                        match kind {
+                            DataModifyKind::SetFrom(SetFrom { target, source }) => {
+                                let value = if let DataTarget::Storage(storage_id) = target {
+                                    if let Some(path) = &source.0 {
+                                        self.nbt_storage.get(storage_id, path)?.clone()
+                                    } else {
+                                        todo!()
+                                    }
+                                } else {
+                                    todo!("{:?}", target);
+                                };
+
+                                if let SNbt::List(l) = value {
+                                    if let [x, y, z] = &l.0[..] {
+                                        let x = x.to_double().unwrap().into_inner();
+                                        let y = y.to_double().unwrap().into_inner();
+                                        let z = z.to_double().unwrap().into_inner();
+
+                                        assert_eq!(x, x as i32 as f64);
+                                        assert_eq!(y, y as i32 as f64);
+                                        assert_eq!(z, z as i32 as f64);
+
+                                        *pos = (x as i32, y as i32, z as i32);
+                                    } else {
+                                        todo!()
+                                    }
+                                }
+
+                                Ok(ExecResult::Unknown)
+                            }
+                            _ => todo!("{:?}", kind)
+                        }
+                    }
                 }
             }
             &ParsedCommand::ScoreSet(PScoreSet {
