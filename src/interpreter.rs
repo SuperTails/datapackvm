@@ -3,7 +3,6 @@ use datapack_common::functions::command::data_modify_kinds::SetFrom;
 use datapack_common::functions::command::execute_sub_commands::*;
 use datapack_common::functions::command::*;
 use datapack_common::functions::command_components::*;
-use datapack_common::functions::raw_text::TextComponent;
 use datapack_common::functions::*;
 use std::borrow::Borrow;
 use std::cmp;
@@ -11,6 +10,7 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::convert::TryFrom;
+use std::fmt::Write;
 use std::str::FromStr;
 
 fn get_name(target: &ScoreboardTarget) -> Option<&ScoreHolder> {
@@ -23,7 +23,7 @@ fn get_name(target: &ScoreboardTarget) -> Option<&ScoreHolder> {
 fn get_target_name(target: &Target) -> Option<&ScoreHolder> {
     match target {
         Target::Name(name) => Some(name),
-        Target::Selector(_) => None,
+        Target::Uuid(_) | Target::Selector(_) => None,
     }
 }
 
@@ -130,7 +130,10 @@ impl Scoreboard {
     }
 
     pub fn set(&mut self, holder: &ScoreHolder, obj: &Objective, value: i32) {
-        let scores = self.0.get_mut(obj).unwrap_or_else(|| panic!("setting a variable in nonexistent objective {:?}", obj));
+        let scores = self
+            .0
+            .get_mut(obj)
+            .unwrap_or_else(|| panic!("setting a variable in nonexistent objective {:?}", obj));
         scores.insert(holder.to_owned(), value);
     }
 }
@@ -189,9 +192,18 @@ impl TryFrom<&BlockSpec> for Block {
                 assert!(block.state.is_empty());
 
                 let path = [
-                    NbtPathPart { name: NbtPathName("RecordItem".to_string()), indices: Vec::new() },
-                    NbtPathPart { name: NbtPathName("tag".to_string()), indices: Vec::new() },
-                    NbtPathPart { name: NbtPathName("Memory".to_string()), indices: Vec::new() },
+                    NbtPathPart {
+                        name: NbtPathName("RecordItem".to_string()),
+                        indices: Vec::new(),
+                    },
+                    NbtPathPart {
+                        name: NbtPathName("tag".to_string()),
+                        indices: Vec::new(),
+                    },
+                    NbtPathPart {
+                        name: NbtPathName("Memory".to_string()),
+                        indices: Vec::new(),
+                    },
                 ];
 
                 let memory = get_nbt_from_compound(&block.nbt, &path);
@@ -326,7 +338,6 @@ impl NbtStorage {
                     panic!("attempt to insert child into non-compound tag");
                 }
             }
-
         } else {
             let tag = get_nbt_from_compound_mut(tag, &path.0);
             *tag = value;
@@ -363,7 +374,8 @@ impl NbtStorage {
             todo!()
         }
 
-        tag.0.contains_key(<_ as Borrow<str>>::borrow(&last_part.name))
+        tag.0
+            .contains_key(<_ as Borrow<str>>::borrow(&last_part.name))
     }
 }
 
@@ -376,9 +388,15 @@ pub fn get_nbt_from_compound<'a>(tag: &'a SNbtCompound, path: &[NbtPathPart]) ->
     get_nbt_from_tag(tag, tail)
 }
 
-pub fn get_nbt_from_compound_mut<'a>(tag: &'a mut SNbtCompound, path: &[NbtPathPart]) -> &'a mut SNbt {
+pub fn get_nbt_from_compound_mut<'a>(
+    tag: &'a mut SNbtCompound,
+    path: &[NbtPathPart],
+) -> &'a mut SNbt {
     let (head, tail) = path.split_first().unwrap();
-    let mut tag = tag.0.get_mut(<_ as Borrow<str>>::borrow(&head.name)).unwrap_or_else(|| panic!("could not get tag {:?}", head.name));
+    let mut tag = tag
+        .0
+        .get_mut(<_ as Borrow<str>>::borrow(&head.name))
+        .unwrap_or_else(|| panic!("could not get tag {:?}", head.name));
     for index in head.indices.iter() {
         tag = get_nbt_index_mut(tag, *index);
     }
@@ -387,7 +405,9 @@ pub fn get_nbt_from_compound_mut<'a>(tag: &'a mut SNbtCompound, path: &[NbtPathP
 
 pub fn get_nbt_child<'a>(tag: &'a SNbt, name: &NbtPathName) -> &'a SNbt {
     if let SNbt::Compound(tag) = tag {
-        tag.0.get(<_ as Borrow<str>>::borrow(name)).unwrap_or_else(|| panic!("could not get tag {:?}", name))
+        tag.0
+            .get(<_ as Borrow<str>>::borrow(name))
+            .unwrap_or_else(|| panic!("could not get tag {:?}", name))
     } else {
         panic!("attempt to access child of a non-compound tag");
     }
@@ -491,7 +511,7 @@ impl Schedule {
     }
 
     pub fn next_tick(&self) -> Option<u32> {
-        self.0.peek().map(|f| f.0.0)
+        self.0.peek().map(|f| f.0 .0)
     }
 
     pub fn get_next(&mut self, time: u32) -> Option<(u32, FunctionIdent)> {
@@ -641,14 +661,33 @@ impl Interpreter {
         }
     }
 
-    fn eval_message(&self, msg: &[TextComponent]) -> String {
+    fn eval_message(&self, msg: &JsonText) -> String {
         let mut result = String::new();
-        let score_getter =
-            |name: &ScoreHolder, obj: &Objective| -> Option<i32> { self.scoreboard.get(name, obj) };
 
-        for s in msg.iter().map(|m| m.as_string(&score_getter).unwrap()) {
-            result.push_str(&s);
+        match msg {
+            JsonText::Bool(bool) => {
+                write!(result, "{}", bool).unwrap();
+            }
+            JsonText::String(string) => result.push_str(string),
+            JsonText::List(list) => {
+                for sub_msg in list {
+                    result.push_str(&self.eval_message(sub_msg))
+                }
+            }
+            JsonText::Compound(compund) => {
+                let mut score_getter = |name: &ScoreHolder, obj: &Objective| -> Option<i32> {
+                    self.scoreboard.get(name, obj)
+                };
+                let mut storage_nbt_getter =
+                    |id: &StorageId, path: &NbtPath| Some(self.nbt_storage.get(id, path).clone());
+                result.push_str(
+                    &compund
+                        .as_string(&mut score_getter, &mut storage_nbt_getter)
+                        .unwrap(),
+                );
+            }
         }
+
         result
     }
 
@@ -705,7 +744,7 @@ impl Interpreter {
                     result
                 }
             }
-            _ => todo!("{:?}", cond.target)
+            _ => todo!("{:?}", cond.target),
         }
     }
 
@@ -860,12 +899,7 @@ impl Interpreter {
                 if path == "RecordItem.tag.Memory" {
                     Ok(*v)
                 } else {
-                    Err(InterpError::NoBlockData(
-                        pos.0,
-                        pos.1,
-                        pos.2,
-                        path,
-                    ))
+                    Err(InterpError::NoBlockData(pos.0, pos.1, pos.2, path))
                 }
             }
             None => Err(InterpError::NoBlockData(
@@ -892,12 +926,7 @@ impl Interpreter {
                     c.command = value.to_string();
                     Ok(())
                 } else {
-                    Err(InterpError::NoBlockData(
-                        pos.0,
-                        pos.1,
-                        pos.2,
-                        path,
-                    ))
+                    Err(InterpError::NoBlockData(pos.0, pos.1, pos.2, path))
                 }
             }
             _ => Err(InterpError::NoBlockData(
@@ -918,7 +947,7 @@ impl Interpreter {
         match value {
             SNbt::Integer(value) => self.set_block_data_int(pos, path, *value),
             SNbt::String(value) => self.set_block_data_str(pos, path, &value.0),
-            _ => todo!("{:?}", value)
+            _ => todo!("{:?}", value),
         }
     }
 
@@ -935,12 +964,7 @@ impl Interpreter {
                     *v = value;
                     Ok(())
                 } else {
-                    Err(InterpError::NoBlockData(
-                        pos.0,
-                        pos.1,
-                        pos.2,
-                        path,
-                    ))
+                    Err(InterpError::NoBlockData(pos.0, pos.1, pos.2, path))
                 }
             }
             None => Err(InterpError::NoBlockData(
@@ -1139,7 +1163,8 @@ impl Interpreter {
                         DataTarget::Storage(storage_id) => {
                             assert!(ty == "int");
 
-                            self.nbt_storage.set(storage_id.clone(), path, SNbt::Integer(value));
+                            self.nbt_storage
+                                .set(storage_id.clone(), path, SNbt::Integer(value));
 
                             Ok(ExecResult::Unknown)
                         }
@@ -1227,7 +1252,6 @@ impl Interpreter {
                         self.scoreboard.set(target, target_obj, rhs);
                     }
                     ScoreOpKind::Add => {
-
                         let mut val = self.get_score(target, target_obj).unwrap();
                         val = val.wrapping_add(rhs);
                         self.scoreboard.set(target, target_obj, val);
@@ -1330,7 +1354,15 @@ impl Interpreter {
 
                 Ok(ExecResult::Unknown)
             }
-            Command::Clone(Clone { start, end, dest }) => {
+            Command::Clone(Clone {
+                start,
+                end,
+                dest,
+                filter,
+            }) => {
+                if !matches!(filter, CloneFilterKind::Replace) {
+                    todo!("Implement clone for other filter kinds")
+                }
                 let start = maybe_based(start, ctx.pos);
                 let end = maybe_based(end, ctx.pos);
                 let dest = maybe_based(dest, ctx.pos);
@@ -1404,7 +1436,6 @@ impl Interpreter {
                     DataTarget::Block(block) => {
                         let pos = maybe_based(block, ctx.pos);
 
-
                         let result = self.get_block_data(pos, path)?;
 
                         Ok(ExecResult::Succeeded(result))
@@ -1435,29 +1466,28 @@ impl Interpreter {
                             todo!("{:?}", kind)
                         }
                     }
-                    DataTarget::Storage(storage_id) => {
-                        match kind {
-                            DataModifyKind::Set(Set { value }) => {
-                                self.nbt_storage.set(storage_id.clone(), path, value.clone());
-                                Ok(ExecResult::Unknown)
-                            }
-                            DataModifyKind::SetFrom(SetFrom { target, source }) => {
-                                let value = if let DataTarget::Storage(storage_id) = target {
-                                    if let Some(path) = &source.0 {
-                                        self.nbt_storage.get(storage_id, path).clone()
-                                    } else {
-                                        todo!()
-                                    }
-                                } else {
-                                    todo!("{:?}", target);
-                                };
-
-                                self.nbt_storage.set(storage_id.clone(), path, value);
-                                Ok(ExecResult::Unknown)
-                            }
-                            k => todo!("{:?}", k),
+                    DataTarget::Storage(storage_id) => match kind {
+                        DataModifyKind::Set(Set { value }) => {
+                            self.nbt_storage
+                                .set(storage_id.clone(), path, value.clone());
+                            Ok(ExecResult::Unknown)
                         }
-                    }
+                        DataModifyKind::SetFrom(SetFrom { target, source }) => {
+                            let value = if let DataTarget::Storage(storage_id) = target {
+                                if let Some(path) = &source.0 {
+                                    self.nbt_storage.get(storage_id, path).clone()
+                                } else {
+                                    todo!()
+                                }
+                            } else {
+                                todo!("{:?}", target);
+                            };
+
+                            self.nbt_storage.set(storage_id.clone(), path, value);
+                            Ok(ExecResult::Unknown)
+                        }
+                        k => todo!("{:?}", k),
+                    },
                     _ => todo!(),
                 }
             }
@@ -1486,7 +1516,7 @@ impl Interpreter {
                 message,
                 target: _target,
             }) => {
-                let msg = self.eval_message(&message.components);
+                let msg = self.eval_message(&message);
                 println!("\n{}\n", msg);
                 self.output.push(msg);
 
@@ -1647,7 +1677,8 @@ impl Interpreter {
         if let Some(cnt) = self.indiv_time.get_mut(&self.program[*current_func].id) {
             *cnt += 1;
         } else {
-            self.indiv_time.insert(self.program[*current_func].id.clone(), 1);
+            self.indiv_time
+                .insert(self.program[*current_func].id.clone(), 1);
         }
     }
 
@@ -1716,7 +1747,7 @@ impl Interpreter {
             self.tick = next_tick;
 
             let (_, next) = self.schedule.get_next(self.tick).unwrap();
-            
+
             let idx = self.get_func_idx(&next);
 
             self.call_stack.push((idx, 0));
